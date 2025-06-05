@@ -14,7 +14,7 @@ import yaml
 
 import fabric_cicd.constants as constants
 from fabric_cicd._parameter._utils import (
-    check_parameter_structure,
+    is_valid_structure,
     process_input_path,
     replace_variables_in_parameter_file,
 )
@@ -36,6 +36,10 @@ class Parameter:
             "maximum": {"instance_pool_id", "replace_value", "item_name"},
         },
         "spark_pool_replace_value": {"type", "name"},
+        "key_value_replace": {
+            "minimum": {"find_key", "replace_value"},
+            "maximum": {"find_key", "replace_value", "item_type", "item_name", "file_path"},
+        },
     }
 
     LOAD_ERROR_MSG = ""
@@ -157,11 +161,8 @@ class Parameter:
             logger.debug(constants.PARAMETER_MSGS["validating"].format(step))
             is_valid, msg = validation_func()
             if not is_valid:
-                # Return True for specific not is_valid cases
-                if step in ("parameter file load", "parameter file structure") and msg in (
-                    "not found",
-                    "old structure",
-                ):
+                # Return True for specific not is_valid case
+                if step == "parameter file load" and msg == "not found":
                     logger.warning(constants.PARAMETER_MSGS["terminate"].format(msg))
                     return True
                 # Throw warning and discontinue validation check for absent parameter
@@ -180,19 +181,14 @@ class Parameter:
 
     def _validate_parameter_structure(self) -> tuple[bool, str]:
         """Validate the parameter file structure."""
-        # TODO: Deprecate old structure check in future versions
-        if check_parameter_structure(self.environment_parameter) == "old":
-            logger.warning(constants.PARAMETER_MSGS["old structure"])
-            logger.warning(constants.PARAMETER_MSGS["raise issue"])
-            return False, "old structure"
-        if check_parameter_structure(self.environment_parameter) == "invalid":
+        if not is_valid_structure(self.environment_parameter):
             return False, constants.PARAMETER_MSGS["invalid structure"]
 
         return True, constants.PARAMETER_MSGS["valid structure"]
 
     def _validate_parameter_names(self) -> tuple[bool, str]:
         """Validate the parameter names in the parameter dictionary."""
-        params = list(self.PARAMETER_KEYS.keys())[:2]
+        params = list(self.PARAMETER_KEYS.keys())[:4]
         for param in self.environment_parameter:
             if param not in params:
                 return False, constants.PARAMETER_MSGS["invalid name"].format(param)

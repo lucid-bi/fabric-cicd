@@ -11,6 +11,36 @@ find_replace:
        - "/Hello World.Notebook/notebook-content.py"
        - "\\subfolder\\Hello World Subfolder.Notebook/notebook-content.py"
 
+key_value_replace:
+    - find_key: $.variables[?(@.name=="SQL_Server")].value
+      replace_value:
+        PPE: "contoso-ppe.database.windows.net"
+        PROD: "contoso-prod.database.windows.net"
+        UAT: "contoso-uat.database.windows.net"
+      # Optional fields:
+      item_type: "VariableLibrary"
+      item_name: "Vars"
+    - find_key: $.variables[?(@.name=="Environment")].value
+      replace_value:
+        PPE: "PPE"
+        PROD: "PROD"
+        UAT: "UAT"
+      # Optional fields:
+      item_type: "VariableLibrary"
+      item_name: "Vars"
+    - find_key: $.variableOverrides[?(@.name=="SQL_Server")].value
+      replace_value:
+        PROD: "contoso-production-override.database.windows.net"
+      file_path: Vars.VariableLibrary/valueSets/PROD.json
+      item_type: "VariableLibrary"
+      item_name: "Vars"
+    - find_key: $.variableOverrides[?(@.name=="Environment")].value
+      replace_value:
+        PROD: "PROD_ENV"
+      file_path: Vars.VariableLibrary/valueSets/PROD.json
+      item_type: "VariableLibrary"
+      item_name: "Vars"
+
 spark_pool:
     # CapacityPool_Large
     - instance_pool_id: "72c68dbc-0775-4d59-909d-a47896f4573b"
@@ -34,20 +64,3 @@ spark_pool:
            name: "WorkspacePool_Medium"
       # Optional field:
       item_name:
-
-# Legacy structure
-#find_replace:
-    # SQL Connection Guid
-    #"db52be81-c2b2-4261-84fa-840c67f4bbd0":
-        #PPE: "81bbb339-8d0b-46e8-bfa6-289a159c0733"
-        #PROD: "5d6a1b16-447f-464a-b959-45d0fed35ca0"
-
-#spark_pool:
-    # CapacityPool_Large
-    #"72c68dbc-0775-4d59-909d-a47896f4573b":
-        #type: "Capacity"
-        #name: "CapacityPool_Large"
-    # CapacityPool_Medium
-    #"e7b8f1c4-4a6e-4b8b-9b2e-8f1e5d6a9c3d":
-        #type: "Workspace"
-        #name: "WorkspacePool_Medium"

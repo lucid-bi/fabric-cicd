@@ -4,7 +4,7 @@
 """Constants for the fabric-cicd package."""
 
 # General
-VERSION = "0.1.16"
+VERSION = "0.1.19"
 DEFAULT_WORKSPACE_ID = "00000000-0000-0000-0000-000000000000"
 DEFAULT_API_ROOT_URL = "https://api.powerbi.com"
 FEATURE_FLAG = set()
@@ -21,16 +21,31 @@ ACCEPTED_ITEM_TYPES_UPN = (
     "MirroredDatabase",
     "VariableLibrary",
     "CopyJob",
+    "Eventhouse",
+    "KQLDatabase",
+    "KQLQueryset",
+    "Reflex",
+    "Eventstream",
+    "Warehouse",
+    "SQLDatabase",
 )
 ACCEPTED_ITEM_TYPES_NON_UPN = ACCEPTED_ITEM_TYPES_UPN
 
 # Publish
-MAX_RETRY_OVERRIDE = {"SemanticModel": 10, "Report": 10, "VariableLibrary": 7}
-SHELL_ONLY_PUBLISH = ["Environment", "Lakehouse"]
+MAX_RETRY_OVERRIDE = {
+    "SemanticModel": 10,
+    "Report": 10,
+    "Eventstream": 10,
+    "KQLDatabase": 10,
+    "VariableLibrary": 7,
+    "SQLDatabase": 7,
+}
+SHELL_ONLY_PUBLISH = ["Environment", "Lakehouse", "Warehouse", "SQLDatabase"]
 
 # REGEX Constants
 VALID_GUID_REGEX = r"^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$"
 WORKSPACE_ID_REFERENCE_REGEX = r'"(default_lakehouse_workspace_id|workspaceId)": "(.*?)"'
+INVALID_FOLDER_CHAR_REGEX = r'[~"#.%&*:<>?/\\{|}]'
 
 # Parameter file configs
 PARAMETER_FILE_NAME = "parameter.yml"
@@ -52,8 +67,6 @@ PARAMETER_MSGS = {
     "invalid content": INVALID_YAML,
     "valid load": f"Successfully loaded {PARAMETER_FILE_NAME}",
     "invalid load": f"Error loading {PARAMETER_FILE_NAME} " + "{}",
-    "old structure": "The parameter file structure used will no longer be supported after April 24, 2025. Please migrate to the new structure",
-    "raise issue": "Raise a GitHub issue here: https://github.com/microsoft/fabric-cicd/issues for migration timeline issues",
     "invalid structure": "Invalid parameter file structure",
     "valid structure": "Parameter file structure is valid",
     "invalid name": "Invalid parameter name '{}' found in the parameter file",

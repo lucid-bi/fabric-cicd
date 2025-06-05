@@ -38,6 +38,16 @@ def publish_all_items(fabric_workspace_obj: FabricWorkspace, item_name_exclude_r
         ...     item_type_in_scope=["Environment", "Notebook", "DataPipeline"]
         ... )
         >>> publish_all_items(workspace)
+
+        With regex name exclusion
+        >>> from fabric_cicd import FabricWorkspace, publish_all_items
+        >>> workspace = FabricWorkspace(
+        ...     workspace_id="your-workspace-id",
+        ...     repository_directory="/path/to/repo",
+        ...     item_type_in_scope=["Environment", "Notebook", "DataPipeline"]
+        ... )
+        >>> exclude_regex = ".*_do_not_publish"
+        >>> publish_all_items(workspace, exclude_regex)
     """
     fabric_workspace_obj = validate_fabric_workspace_obj(fabric_workspace_obj)
 
@@ -58,9 +68,15 @@ def publish_all_items(fabric_workspace_obj: FabricWorkspace, item_name_exclude_r
     if "VariableLibrary" in fabric_workspace_obj.item_type_in_scope:
         print_header("Publishing Variable Libraries")
         items.publish_variablelibraries(fabric_workspace_obj)
+    if "Warehouse" in fabric_workspace_obj.item_type_in_scope:
+        print_header("Publishing Warehouses")
+        items.publish_warehouses(fabric_workspace_obj)
     if "Lakehouse" in fabric_workspace_obj.item_type_in_scope:
         print_header("Publishing Lakehouses")
         items.publish_lakehouses(fabric_workspace_obj)
+    if "SQLDatabase" in fabric_workspace_obj.item_type_in_scope:
+        print_header("Publishing SQL Databases")
+        items.publish_sqldatabases(fabric_workspace_obj)
     if "MirroredDatabase" in fabric_workspace_obj.item_type_in_scope:
         print_header("Publishing MirroredDatabase")
         items.publish_mirroreddatabase(fabric_workspace_obj)
@@ -82,6 +98,21 @@ def publish_all_items(fabric_workspace_obj: FabricWorkspace, item_name_exclude_r
     if "CopyJob" in fabric_workspace_obj.item_type_in_scope:
         print_header("Publishing CopyJobs")
         items.publish_copyjobs(fabric_workspace_obj)
+    if "Eventhouse" in fabric_workspace_obj.item_type_in_scope:
+        print_header("Publishing Eventhouses")
+        items.publish_eventhouses(fabric_workspace_obj)
+    if "KQLDatabase" in fabric_workspace_obj.item_type_in_scope:
+        print_header("Publishing KQL Databases")
+        items.publish_kqldatabases(fabric_workspace_obj)
+    if "KQLQueryset" in fabric_workspace_obj.item_type_in_scope:
+        print_header("Publishing KQL Querysets")
+        items.publish_kqlquerysets(fabric_workspace_obj)
+    if "Reflex" in fabric_workspace_obj.item_type_in_scope:
+        print_header("Publishing Activators")
+        items.publish_activators(fabric_workspace_obj)
+    if "Eventstream" in fabric_workspace_obj.item_type_in_scope:
+        print_header("Publishing Eventstreams")
+        items.publish_eventstreams(fabric_workspace_obj)
 
     # Check Environment Publish
     if "Environment" in fabric_workspace_obj.item_type_in_scope:
@@ -127,22 +158,37 @@ def unpublish_all_orphan_items(fabric_workspace_obj: FabricWorkspace, item_name_
     fabric_workspace_obj._refresh_repository_items()
     print_header("Unpublishing Orphaned Items")
 
+    # Lakehouses, SQL Databases, and Warehouses can only be unpublished if their feature flags are set
+    unpublish_flag_mapping = {
+        "Lakehouse": "enable_lakehouse_unpublish",
+        "SQLDatabase": "enable_sqldatabase_unpublish",
+        "Warehouse": "enable_warehouse_unpublish",
+    }
+
     # Define order to unpublish items
     unpublish_order = []
-    for x in [
+    for item_type in [
+        "Eventstream",
+        "Reflex",
+        "KQLQueryset",
+        "KQLDatabase",
+        "Eventhouse",
         "DataPipeline",
         "Report",
         "SemanticModel",
         "Notebook",
         "Environment",
         "MirroredDatabase",
+        "SQLDatabase",
         "Lakehouse",
+        "Warehouse",
         "VariableLibrary",
     ]:
-        if x in fabric_workspace_obj.item_type_in_scope and (
-            x != "Lakehouse" or "enable_lakehouse_unpublish" in constants.FEATURE_FLAG
-        ):
-            unpublish_order.append(x)
+        if item_type in fabric_workspace_obj.item_type_in_scope:
+            unpublish_flag = unpublish_flag_mapping.get(item_type)
+            # Append item_type if no feature flag is required or the corresponding flag is enabled
+            if not unpublish_flag or unpublish_flag in constants.FEATURE_FLAG:
+                unpublish_order.append(item_type)
 
     for item_type in unpublish_order:
         deployed_names = set(fabric_workspace_obj.deployed_items.get(item_type, {}).keys())
@@ -177,5 +223,6 @@ def unpublish_all_orphan_items(fabric_workspace_obj: FabricWorkspace, item_name_
             fabric_workspace_obj._unpublish_item(item_name=item_name, item_type=item_type)
 
     fabric_workspace_obj._refresh_deployed_items()
+    fabric_workspace_obj._refresh_deployed_folders()
     if "disable_workspace_folder_publish" not in constants.FEATURE_FLAG:
         fabric_workspace_obj._unpublish_folders()

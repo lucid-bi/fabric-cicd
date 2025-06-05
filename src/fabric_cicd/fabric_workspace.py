@@ -103,6 +103,7 @@ class FabricWorkspace:
         self.endpoint = FabricEndpoint(
             # if credential is not defined, use DefaultAzureCredential
             token_credential=(
+                # CodeQL [SM05139] Public library needing to have a default auth when user doesn't provide token. Not internal Azure product.
                 DefaultAzureCredential() if token_credential is None else validate_token_credential(token_credential)
             )
         )
@@ -289,9 +290,9 @@ class FabricWorkspace:
             item_obj: The Item object instance that provides the item type and item name.
         """
         from fabric_cicd._parameter._utils import (
-            check_parameter_structure,
             check_replacement,
             process_input_path,
+            replace_key_value,
         )
 
         # Parse the file_obj and item_obj
@@ -300,34 +301,33 @@ class FabricWorkspace:
         item_name = item_obj.name
         file_path = file_obj.file_path
 
+        if "key_value_replace" in self.environment_parameter:
+            for parameter_dict in self.environment_parameter.get("key_value_replace"):
+                input_type = parameter_dict.get("item_type")
+                input_name = parameter_dict.get("item_name")
+                input_path = process_input_path(self.repository_directory, parameter_dict.get("file_path"))
+                if (
+                    check_replacement(input_type, input_name, input_path, item_type, item_name, file_path)
+                    and ".json" in file_path.suffix
+                ):
+                    raw_file = replace_key_value(parameter_dict, raw_file, self.environment)
+
         if "find_replace" in self.environment_parameter:
-            structure_type = check_parameter_structure(self.environment_parameter, param_name="find_replace")
             msg = "Replacing {} with {} in {}.{}"
 
-            # Handle new parameter file structure
-            if structure_type == "new":
-                for parameter_dict in self.environment_parameter["find_replace"]:
-                    find_value = parameter_dict["find_value"]
-                    replace_value = parameter_dict["replace_value"]
-                    input_type = parameter_dict.get("item_type")
-                    input_name = parameter_dict.get("item_name")
-                    input_path = process_input_path(self.repository_directory, parameter_dict.get("file_path"))
+            for parameter_dict in self.environment_parameter["find_replace"]:
+                find_value = parameter_dict["find_value"]
+                replace_value = parameter_dict["replace_value"]
+                input_type = parameter_dict.get("item_type")
+                input_name = parameter_dict.get("item_name")
+                input_path = process_input_path(self.repository_directory, parameter_dict.get("file_path"))
 
-                    # Perform replacement if a condition is met and replace any found references with specified environment value
-                    if (find_value in raw_file and self.environment in replace_value) and check_replacement(
-                        input_type, input_name, input_path, item_type, item_name, file_path
-                    ):
-                        raw_file = raw_file.replace(find_value, replace_value[self.environment])
-                        logger.debug(msg.format(find_value, replace_value[self.environment], item_name, item_type))
-
-            # Handle original parameter file structure
-            # TODO: Deprecate old structure handling by April 24, 2025
-            if structure_type == "old":
-                for key, parameter_dict in self.environment_parameter["find_replace"].items():
-                    if key in raw_file and self.environment in parameter_dict:
-                        # replace any found references with specified environment value
-                        raw_file = raw_file.replace(key, parameter_dict[self.environment])
-                        logger.debug(msg.format(key, parameter_dict, item_name, item_type))
+                # Perform replacement if a condition is met and replace any found references with specified environment value
+                if (find_value in raw_file and self.environment in replace_value) and check_replacement(
+                    input_type, input_name, input_path, item_type, item_name, file_path
+                ):
+                    raw_file = raw_file.replace(find_value, replace_value[self.environment])
+                    logger.debug(msg.format(find_value, replace_value[self.environment], item_name, item_type))
 
         return raw_file
 
@@ -400,14 +400,16 @@ class FabricWorkspace:
             func_process_file: Custom function to process file contents. Defaults to None.
             **kwargs: Additional keyword arguments.
         """
+        item = self.repository_items[item_type][item_name]
+
         # Skip publishing if the item is excluded by the regex
         if self.publish_item_name_exclude_regex:
             regex_pattern = check_regex(self.publish_item_name_exclude_regex)
             if regex_pattern.match(item_name):
+                item.skip_publish = True
                 logger.info(f"Skipping publishing of {item_type} '{item_name}' due to exclusion regex.")
                 return
 
-        item = self.repository_items[item_type][item_name]
         item_guid = item.guid
         item_files = item.item_files
 
@@ -427,12 +429,11 @@ class FabricWorkspace:
             item_payload = []
             for file in item_files:
                 if not re.match(exclude_path, file.relative_path):
-                    if file.type == "text":
+                    if file.type == "text" and not str(file.file_path).endswith(".platform"):
                         file.contents = func_process_file(self, item, file) if func_process_file else file.contents
-                        if not str(file.file_path).endswith(".platform"):
-                            file.contents = self._replace_logical_ids(file.contents)
-                            file.contents = self._replace_parameters(file, item)
-                            file.contents = self._replace_workspace_ids(file.contents)
+                        file.contents = self._replace_logical_ids(file.contents)
+                        file.contents = self._replace_parameters(file, item)
+                        file.contents = self._replace_workspace_ids(file.contents)
 
                     item_payload.append(file.base64_payload)
 
@@ -584,7 +585,7 @@ class FabricWorkspace:
 
         # Now, for every folder, check if any of its subfolders is in platform_folders
         for folder in root_path.rglob("*"):
-            if not folder.is_dir() or folder == root_path:
+            if not folder.is_dir() or folder == root_path or folder.name == ".children":
                 continue
 
             # Skip folders that directly contain a .platform file
@@ -616,6 +617,10 @@ class FabricWorkspace:
             folder_parent_path = "/".join(folder_path.split("/")[:-1])
             folder_parent_id = self.repository_folders.get(folder_parent_path, None)
 
+            if re.search(constants.INVALID_FOLDER_CHAR_REGEX, folder_name):
+                msg = f"Folder name '{folder_name}' contains invalid characters."
+                raise InputError(msg, logger)
+
             request_body = {"displayName": folder_name}
             if folder_parent_id:
                 request_body["parentFolderId"] = folder_parent_id
@@ -630,28 +635,57 @@ class FabricWorkspace:
         logger.info(f"{constants.INDENT}Published")
 
     def _unpublish_folders(self) -> None:
-        """Unublishes all empty folders in workspace."""
+        """Unpublishes all empty folders in workspace."""
         # Sort folders by the number of '/' in their paths (descending order)
         sorted_folder_ids = [
             self.deployed_folders[key]
             for key in sorted(self.deployed_folders.keys(), key=lambda path: path.count("/"), reverse=True)
         ]
 
+        ## Any folder that neither contains items nor is an ancestor of a folder
+        ## containing items is considered orphaned
+
+        # Create a set of folders that contain items
+        unorphaned_folders = {
+            item.folder_id for items in self.deployed_items.values() for item in items.values() if item.folder_id
+        }
+        # Skip deletion if all deployed folders are unorphaned
+        if unorphaned_folders == set(sorted_folder_ids):
+            return
+
+        # Create a reversed mapping for folder_id to folder_path lookups
+        folder_id_to_path_mapping = {folder_id: folder_path for folder_path, folder_id in self.deployed_folders.items()}
+
+        # Create a copy of the unorphaned_folders set to safely iterate while modifying the original set
+        folder_lookup = unorphaned_folders.copy()
+
+        # For each folder containing items, identify and protect all its ancestor folders from deletion
+        for folder_id in folder_lookup:
+            if folder_id in folder_id_to_path_mapping:
+                # Get the folder path
+                folder_path = folder_id_to_path_mapping[folder_id]
+
+            # Move up the folder hierarchy and add all ancestor folders
+            current_folder_path = folder_path
+            while current_folder_path != "/":
+                # Get the parent folder path
+                current_folder_path = current_folder_path.rsplit("/", 1)[0] or "/"
+
+                # Get the folder_id for this path and add to the unorphaned_folder set
+                parent_folder_id = self.deployed_folders.get(current_folder_path)
+                if parent_folder_id:
+                    unorphaned_folders.add(parent_folder_id)
+
+        # Check if deletion can be skipped after update to unorphaned_folder set
+        if unorphaned_folders == set(sorted_folder_ids):
+            return
+
         logger.info("Unpublishing Workspace Folders")
-
-        ## any folder that is not in folderid_dict is an orphaned folder
-
-        # Get folders with items
-        deployed_folder_ids_with_items = []
-
-        for items in self.deployed_items.values():
-            for item in items.values():
-                deployed_folder_ids_with_items.append(item.folder_id)
 
         # Pop all folders
 
         for folder_id in sorted_folder_ids:
-            if folder_id not in deployed_folder_ids_with_items:
+            if folder_id not in unorphaned_folders:
                 # Folder deployed, but not in repository
 
                 # Delete the folder from the workspace

@@ -5,6 +5,7 @@
 
 import logging
 import os
+import re
 from pathlib import Path
 
 import dpath
@@ -12,7 +13,6 @@ import yaml
 
 from fabric_cicd import FabricWorkspace, constants
 from fabric_cicd._common._fabric_endpoint import handle_retry
-from fabric_cicd._parameter._utils import check_parameter_structure
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +30,15 @@ def publish_environments(fabric_workspace_obj: FabricWorkspace) -> None:
     check_environment_publish_state(fabric_workspace_obj, True)
 
     item_type = "Environment"
-    for item_name in fabric_workspace_obj.repository_items.get(item_type, {}):
+    for item_name, item in fabric_workspace_obj.repository_items.get(item_type, {}).items():
         # Only deploy the shell for environments
         fabric_workspace_obj._publish_item(
             item_name=item_name,
             item_type=item_type,
             skip_publish_logging=True,
         )
+        if item.skip_publish:
+            continue
         _publish_environment_metadata(fabric_workspace_obj, item_name=item_name)
 
 
@@ -92,7 +94,14 @@ def check_environment_publish_state(fabric_workspace_obj: FabricWorkspace, initi
 
     environments = fabric_workspace_obj.repository_items.get("Environment", {})
 
-    logger.info(f"Checking Environment Publish State for {[k for k in environments]}")
+    filtered_environments = [
+        k
+        for k in environments
+        if not fabric_workspace_obj.publish_item_name_exclude_regex
+        or not re.search(fabric_workspace_obj.publish_item_name_exclude_regex, k)
+    ]
+
+    logger.info(f"Checking Environment Publish State for {filtered_environments}")
 
     while ongoing_publish:
         ongoing_publish = False
@@ -144,25 +153,15 @@ def _update_compute_settings(
         if "instance_pool_id" in yaml_body:
             pool_id = yaml_body["instance_pool_id"]
             if "spark_pool" in fabric_workspace_obj.environment_parameter:
-                structure_type = check_parameter_structure(fabric_workspace_obj.environment_parameter, "spark_pool")
                 parameter_dict = fabric_workspace_obj.environment_parameter["spark_pool"]
-                # Handle new parameter file format
-                if structure_type == "new":
-                    for key in parameter_dict:
-                        instance_pool_id = key["instance_pool_id"]
-                        replace_value = key["replace_value"]
-                        input_name = key.get("item_name")
-                        if instance_pool_id == pool_id and (input_name == item_name or not input_name):
-                            # replace any found references with specified environment value
-                            yaml_body["instancePool"] = replace_value[fabric_workspace_obj.environment]
-                            del yaml_body["instance_pool_id"]
-
-                # Handle original parameter file format
-                # TODO: Deprecate old structure handling by April 24, 2025
-                if structure_type == "old" and pool_id in parameter_dict:
-                    # replace any found references with specified environment value
-                    yaml_body["instancePool"] = parameter_dict[pool_id]
-                    del yaml_body["instance_pool_id"]
+                for key in parameter_dict:
+                    instance_pool_id = key["instance_pool_id"]
+                    replace_value = key["replace_value"]
+                    input_name = key.get("item_name")
+                    if instance_pool_id == pool_id and (input_name == item_name or not input_name):
+                        # replace any found references with specified environment value
+                        yaml_body["instancePool"] = replace_value[fabric_workspace_obj.environment]
+                        del yaml_body["instance_pool_id"]
 
         yaml_body = _convert_environment_compute_to_camel(fabric_workspace_obj, yaml_body)
 

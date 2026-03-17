@@ -9,7 +9,98 @@ find_replace:
       item_name: ["Hello World", "Hello World Subfolder"]
       file_path:
        - "/Hello World.Notebook/notebook-content.py"
-       - "\\subfolder\\Hello World Subfolder.Notebook/notebook-content.py"
+       - "/subfolder/Hello World Subfolder.Notebook/notebook-content.py"
+    # Lakehouse Connection Guid regex
+    - find_value: \#\s*META\s+"default_lakehouse":\s*"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+      replace_value:
+      # Variable: $items.type.name.attribute (Note: item type and name values are CASE SENSITIVE; id attribute returns the deployed item's id/guid)
+        PPE: "$items.Lakehouse.WithoutSchema.id"   
+        PROD: "$items.Lakehouse.WithoutSchema.id" 
+      # Optional fields:
+      is_regex: "true"
+      file_path: "/Example Notebook.Notebook/notebook-content.py"
+    # Lakehouse workspace id regex
+    - find_value: \#\s*META\s+"default_lakehouse_workspace_id":\s*"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+      replace_value:
+      # Variable: $workspace.id -> target workspace id
+        PPE: "$workspace.id"
+        PROD: "$workspace.id"
+      # Optional fields:
+      is_regex: "true"
+      file_path: "/Example Notebook.Notebook/notebook-content.py"
+    # SQL connection string
+    - find_value: "sqlserverconnectionstringinoriginlakehouse.com"
+      replace_value:
+      # Variable: $items.type.name.attribute (Note: item type and name values are CASE SENSITIVE; sqlendpoint attribute returns the deployed item's sql endpoint)
+        PPE: "$items.Lakehouse.WithoutSchema.sqlendpoint"   
+        PROD: "$items.Lakehouse.WithoutSchema.sqlendpoint" 
+      # Optional fields:
+      file_path: "/Example Notebook.Notebook/notebook-content.py"
+    # Eventhouse query URI
+    - find_value: "https://trd-origineventhouse.z4.kusto.fabric.microsoft.com"
+      replace_value:
+      # Variable: $items.type.name.attribute (Note: item type and name values are CASE SENSITIVE; queryserviceuri attribute returns the deployed item's query service URI)
+        PPE: "$items.Eventhouse.SampleEventhouse.queryserviceuri"   
+        PROD: "$items.Eventhouse.SampleEventhouse.queryserviceuri" 
+      # Optional fields:
+      file_path: "/Example Notebook.Notebook/notebook-content.py"
+    # Report byConnection - workspace id in connection string
+    - find_value: "dev-workspace-id"
+      replace_value:
+        PPE: "$workspace.$id"
+        PROD: "$workspace.$id"
+      # Optional fields:
+      file_path: "/ByConnection.Report/definition.pbir"
+    # Report byConnection - semantic model name in connection string
+    - find_value: "dev-semantic-model"
+      replace_value:
+        PPE: "ABC"
+        PROD: "ABC"
+      # Optional fields:
+      file_path: "/ByConnection.Report/definition.pbir"
+    # Report byConnection - semantic model id in connection string using dynamic replacement
+    - find_value: "00000000-0000-0000-0000-000000000000"
+      replace_value:
+      # Variable: $items.type.name.attribute (Note: item type and name values are CASE SENSITIVE; id attribute returns the deployed item's id/guid)
+        PPE: "$items.SemanticModel.ABC.$id"
+        PROD: "$items.SemanticModel.ABC.$id"
+      # Optional fields:
+      file_path: "/ByConnection.Report/definition.pbir"
+
+key_value_replace:
+    - find_key: $.variables[?(@.name=="SQL_Server")].value
+      replace_value:
+        PPE: "contoso-ppe.database.windows.net"
+        PROD: "contoso-prod.database.windows.net"
+        UAT: "contoso-uat.database.windows.net"
+      # Optional fields:
+      item_type: "VariableLibrary"
+      item_name: "Vars"
+    - find_key: $.variables[?(@.name=="Environment")].value
+      replace_value:
+        PPE: "PPE"
+        PROD: "PROD"
+        UAT: "UAT"
+      # Optional fields:
+      item_type: "VariableLibrary"
+      item_name: "Vars"
+    - find_key: $.variableOverrides[?(@.name=="SQL_Server")].value
+      replace_value:
+        PROD: "contoso-production-override.database.windows.net"
+      file_path: Vars.VariableLibrary/valueSets/PROD.json
+      item_type: "VariableLibrary"
+      item_name: "Vars"
+    - find_key: $.variableOverrides[?(@.name=="Environment")].value
+      replace_value:
+        PROD: "PROD_ENV"
+      file_path: Vars.VariableLibrary/valueSets/PROD.json
+      item_type: "VariableLibrary"
+      item_name: "Vars"
+    - find_key: $.schedules[?(@.jobType=="Execute")].enabled
+      replace_value:
+        PPE: false
+        PROD: true
+      file_path: "**/.schedules"
 
 spark_pool:
     # CapacityPool_Large
@@ -34,20 +125,15 @@ spark_pool:
            name: "WorkspacePool_Medium"
       # Optional field:
       item_name:
-
-# Legacy structure
-#find_replace:
-    # SQL Connection Guid
-    #"db52be81-c2b2-4261-84fa-840c67f4bbd0":
-        #PPE: "81bbb339-8d0b-46e8-bfa6-289a159c0733"
-        #PROD: "5d6a1b16-447f-464a-b959-45d0fed35ca0"
-
-#spark_pool:
-    # CapacityPool_Large
-    #"72c68dbc-0775-4d59-909d-a47896f4573b":
-        #type: "Capacity"
-        #name: "CapacityPool_Large"
-    # CapacityPool_Medium
-    #"e7b8f1c4-4a6e-4b8b-9b2e-8f1e5d6a9c3d":
-        #type: "Workspace"
-        #name: "WorkspacePool_Medium"
+      
+# Supports default connections and per-item overrides (single connection only per model)
+semantic_model_binding:
+    default:
+        connection_id:
+            PPE: "76e05dfe-9855-4e3d-a410-1dda048dbe99"
+            PROD: "c4f8e2b1-3d2a-4f5b-9c6e-7a8b9c0d1e2f"
+    models:
+        - semantic_model_name: ["cloudconnections", "MySemanticModel_ADLS_Gen2"]
+          connection_id:
+            PPE: "f96870d5-5f86-49ad-bf41-5967fd7c1c6d"
+            PROD: "a1b2c3d4-5678-90ab-cdef-1234567890ab"

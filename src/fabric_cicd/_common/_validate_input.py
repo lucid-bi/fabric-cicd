@@ -10,11 +10,13 @@ any user input throughout the package
 import logging
 import re
 from pathlib import Path
+from typing import Optional
 
 from azure.core.credentials import TokenCredential
 
 import fabric_cicd.constants as constants
 from fabric_cicd._common._exceptions import InputError
+from fabric_cicd.constants import FeatureFlag, OperationType
 from fabric_cicd.fabric_workspace import FabricWorkspace
 
 logger = logging.getLogger(__name__)
@@ -47,29 +49,24 @@ def validate_data_type(expected_type: str, variable_name: str, input_value: any)
     return input_value
 
 
-def validate_item_type_in_scope(input_value: list, upn_auth: bool) -> list:
+def validate_item_type_in_scope(input_value: Optional[list]) -> list:
     """
     Validate the item type in scope.
 
     Args:
-        input_value: The input value to validate.
-        upn_auth: Whether UPN authentication is used.
+        input_value: The input value to validate. If None, defaults to all supported item types.
     """
-    accepted_item_types_upn = constants.ACCEPTED_ITEM_TYPES_UPN
-    accepted_item_types_non_upn = constants.ACCEPTED_ITEM_TYPES_NON_UPN
+    accepted_item_types = constants.ACCEPTED_ITEM_TYPES
 
-    accepted_item_types = accepted_item_types_upn if upn_auth else accepted_item_types_non_upn
+    # If None, return all accepted item types
+    if input_value is None:
+        return list(accepted_item_types)
 
     validate_data_type("list[string]", "item_type_in_scope", input_value)
 
     for item_type in input_value:
         if item_type not in accepted_item_types:
-            msg = (
-                f"Invalid or unsupported item type: '{item_type}'. "
-                f"For User Identity Authentication, must be one of {', '.join(accepted_item_types_upn)}. "
-                f"For Service Principal or Managed Identity Authentication, "
-                f"must be one of {', '.join(accepted_item_types_non_upn)}."
-            )
+            msg = f"Invalid or unsupported item type: '{item_type}'. Must be one of {', '.join(accepted_item_types)}."
             raise InputError(msg, logger)
 
     return input_value
@@ -160,3 +157,98 @@ def validate_token_credential(input_value: TokenCredential) -> TokenCredential:
     validate_data_type("TokenCredential", "credential", input_value)
 
     return input_value
+
+
+def validate_experimental_param(
+    param_value: Optional[str],
+    required_flag: "FeatureFlag",
+    warning_message: str,
+    risk_warning: str,
+) -> None:
+    """
+    Generic validation for optional parameters requiring experimental feature flags.
+
+    Args:
+        param_value: The parameter value (None means skip validation).
+        required_flag: The specific feature flag required (in addition to experimental).
+        warning_message: Primary warning message when feature is enabled.
+        risk_warning: Risk/caution warning message.
+
+    Raises:
+        InputError: If required feature flags are not enabled.
+    """
+    from fabric_cicd.constants import FeatureFlag
+
+    if param_value is None:
+        return
+
+    if (
+        FeatureFlag.ENABLE_EXPERIMENTAL_FEATURES.value not in constants.FEATURE_FLAG
+        or required_flag.value not in constants.FEATURE_FLAG
+    ):
+        msg = f"Feature flags 'enable_experimental_features' and '{required_flag.value}' must be set."
+        raise InputError(msg, logger)
+
+    logger.warning(warning_message)
+    logger.warning(risk_warning)
+
+
+def validate_items_to_include(items_to_include: Optional[list[str]], operation: "OperationType") -> None:
+    """
+    Validate items_to_include parameter and check required feature flags.
+
+    Args:
+        items_to_include: List of items in "item_name.item_type" format, or None.
+        operation: The type of operation being performed (publish or unpublish).
+
+    Raises:
+        InputError: If required feature flags are not enabled.
+    """
+    from fabric_cicd.constants import FeatureFlag
+
+    validate_experimental_param(
+        param_value=items_to_include,
+        required_flag=FeatureFlag.ENABLE_ITEMS_TO_INCLUDE,
+        warning_message=f"Selective {operation.value} is enabled.",
+        risk_warning=f"Using items_to_include is risky as it can prevent needed dependencies from being {operation.value}.  Use at your own risk.",
+    )
+
+
+def validate_folder_path_exclude_regex(folder_path_exclude_regex: Optional[str]) -> None:
+    """
+    Validate folder_path_exclude_regex parameter and check required feature flags.
+
+    Args:
+        folder_path_exclude_regex: Regex pattern to exclude items based on their folder path, or None.
+
+    Raises:
+        InputError: If required feature flags are not enabled.
+    """
+    from fabric_cicd.constants import FeatureFlag
+
+    validate_experimental_param(
+        param_value=folder_path_exclude_regex,
+        required_flag=FeatureFlag.ENABLE_EXCLUDE_FOLDER,
+        warning_message="Folder path exclusion is enabled.",
+        risk_warning="Using folder_path_exclude_regex is risky as it can prevent needed dependencies from being deployed.  Use at your own risk.",
+    )
+
+
+def validate_shortcut_exclude_regex(shortcut_exclude_regex: Optional[str]) -> None:
+    """
+    Validate shortcut_exclude_regex parameter and check required feature flags.
+
+    Args:
+        shortcut_exclude_regex: Regex pattern to exclude specific shortcuts from being published, or None.
+
+    Raises:
+        InputError: If required feature flags are not enabled.
+    """
+    from fabric_cicd.constants import FeatureFlag
+
+    validate_experimental_param(
+        param_value=shortcut_exclude_regex,
+        required_flag=FeatureFlag.ENABLE_SHORTCUT_EXCLUDE,
+        warning_message="Shortcut exclusion is enabled.",
+        risk_warning="Using shortcut_exclude_regex will selectively exclude shortcuts from being deployed to lakehouses. Use with caution.",
+    )

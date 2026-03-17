@@ -12,15 +12,16 @@ nav:
           - How To: how_to/index.md
           - Getting Started: how_to/getting_started.md
           - Item Types: how_to/item_types.md
+          - Configuration Deployment: how_to/config_deployment.md
           - Parameterization: how_to/parameterization.md
           - Optional Features: how_to/optional_feature.md
+          - Troubleshooting: how_to/troubleshooting.md
     - Examples:
           - Examples: example/index.md
           - Authentication: example/authentication.md
           - Deployment Variables: example/deployment_variable.md
           - Release Pipelines: example/release_pipeline.md
     - Code Reference: code_reference.md
-    - Contribution: contribution.md
     - Changelog: changelog.md
     - About: about.md
 
@@ -57,6 +58,7 @@ extra_css:
 hooks:
     - docs/config/pre-build/update_item_types.py
     - docs/config/pre-build/section_toc.py
+    - docs/config/pre-build/update_python_version.py
 
 plugins:
     - search:
@@ -116,6 +118,7 @@ markdown_extensions:
     - md_in_html
     - toc:
           permalink: true
+          toc_depth: 2
     - admonition
     - pymdownx.highlight:
           anchor_linenums: true

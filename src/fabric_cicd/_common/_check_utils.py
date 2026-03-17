@@ -3,12 +3,14 @@
 
 """Utility functions for checking file types and versions."""
 
+import json
 import logging
 import re
 from pathlib import Path
 
 import filetype
 import requests
+import yaml
 from packaging import version
 
 import fabric_cicd.constants as constants
@@ -24,7 +26,7 @@ def parse_changelog() -> dict[str, list[str]]:
 
     try:
         response = requests.get(
-            "https://raw.githubusercontent.com/microsoft/fabric-cicd/refs/heads/main/src/fabric_cicd/changelog.md"
+            "https://raw.githubusercontent.com/microsoft/fabric-cicd/refs/heads/main/docs/changelog.md"
         )
         if response.status_code == 200:
             content = response.text
@@ -35,7 +37,7 @@ def parse_changelog() -> dict[str, list[str]]:
         logger.debug(f"Error fetching online changelog: {e}")
         return {}
 
-    version_pattern = r"## Version (\d+\.\d+\.\d+).*?(?=## Version|\Z)"
+    version_pattern = r"## \[v(\d+\.\d+\.\d+)\].*?(?=## \[v|\Z)"
     changelog_dict = {}
 
     for match in re.finditer(version_pattern, content, re.DOTALL):
@@ -125,3 +127,37 @@ def check_regex(regex: str) -> re.Pattern:
         msg = f"An error occurred with the regex provided: {e}"
         raise ValueError(msg) from e
     return regex_pattern
+
+
+def check_valid_json_content(content: str) -> bool:
+    """
+    Check if the given string content is valid JSON.
+
+    Args:
+        content: The string content to validate as JSON.
+
+    Returns:
+        bool: True if the content is valid JSON, False otherwise.
+    """
+    try:
+        json.loads(content)
+        return True
+    except json.JSONDecodeError:
+        return False
+
+
+def check_valid_yaml_content(content: str) -> bool:
+    """
+    Check if the given string content is valid YAML.
+
+    Args:
+        content: The string content to validate as YAML.
+
+    Returns:
+        bool: True if the content is valid YAML, False otherwise.
+    """
+    try:
+        yaml.safe_load(content)
+        return True
+    except yaml.YAMLError:
+        return False

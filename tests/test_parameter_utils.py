@@ -1,0 +1,1836 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""
+Tests for the parameter utility functions in _utils.py.
+The tests focused on path handling functions should be compatible with both Windows and Linux.
+"""
+
+import json
+import logging
+import re
+import shutil
+import tempfile
+from pathlib import Path
+from unittest import mock
+from unittest.mock import MagicMock
+
+import pytest
+import yaml
+
+import fabric_cicd.constants as constants
+
+# Logger for testing
+logger = logging.getLogger(__name__)
+
+
+@pytest.fixture
+def temp_repository():
+    """Creates a temporary directory structure mocking a repository for testing."""
+    temp_dir = Path(tempfile.mkdtemp())
+    try:
+        # Create test directory structure
+        (temp_dir / "folder1").mkdir()
+        (temp_dir / "folder1" / "subfolder").mkdir()
+        (temp_dir / "folder2").mkdir()
+
+        # Create test files
+        (temp_dir / "file1.txt").write_text("content1")
+        (temp_dir / "file2.json").write_text("content2")
+        (temp_dir / "folder1" / "file3.py").write_text("content3")
+        (temp_dir / "folder1" / "subfolder" / "file4.md").write_text("content4")
+        (temp_dir / "folder2" / "file5.txt").write_text("content5")
+
+        # Return the temporary directory path
+        yield temp_dir
+    finally:
+        # Clean up temporary directory after tests
+        shutil.rmtree(temp_dir)
+
+
+from fabric_cicd._common._exceptions import InputError, ParsingError
+from fabric_cicd._parameter._utils import (
+    _check_parameter_structure,
+    _extract_item_attribute,
+    _find_match,
+    _process_regular_path,
+    _process_wildcard_path,
+    _resolve_file_path,
+    _validate_wildcard_syntax,
+    check_replacement,
+    extract_find_value,
+    extract_parameter_filters,
+    extract_replace_value,
+    is_valid_structure,
+    process_environment_key,
+    process_input_path,
+    replace_key_value,
+    replace_variables_in_parameter_file,
+)
+
+
+class TestParameterUtilities:
+    """Tests for parameter utilities in _utils.py."""
+
+    @pytest.fixture
+    def mock_workspace(self):
+        """Creates a mock FabricWorkspace for testing."""
+        mock_ws = mock.MagicMock()
+        mock_ws.repository_directory = Path("/mock/repository")
+        mock_ws.workspace_id = "mock-workspace-id"
+        mock_ws.workspace_items = {
+            "Notebook": {
+                "Test Notebook": {"id": "notebook-id", "sqlendpoint": "", "sqlendpointid": "", "queryserviceuri": ""},
+            },
+            "Warehouse": {
+                "TestWarehouse": {
+                    "id": "warehouse-id",
+                    "sqlendpoint": "warehouse-endpoint",
+                    "sqlendpointid": "",
+                    "queryserviceuri": "",
+                },
+            },
+            "Lakehouse": {
+                "Test_Lakehouse": {
+                    "id": "lakehouse-id",
+                    "sqlendpoint": "lakehouse-endpoint",
+                    "sqlendpointid": "lakehouse-sql-endpoint-id",
+                    "queryserviceuri": "",
+                },
+            },
+            "Eventhouse": {
+                "Test Eventhouse": {
+                    "id": "eventhouse-id",
+                    "sqlendpoint": "",
+                    "sqlendpointid": "",
+                    "queryserviceuri": "eventhouse-query-uri",
+                },
+            },
+            "SQLDatabase": {
+                "TestSQLDatabase": {
+                    "id": "sqldatabase-id",
+                    "sqlendpoint": "test-sql-server.database.fabric.microsoft.com,1433",
+                    "sqlendpointid": "",
+                    "queryserviceuri": "",
+                },
+            },
+        }
+        mock_ws.repository_items = {
+            "Dataflow": {
+                "Source Dataflow": {"id": "source-dataflow-id"},
+            }
+        }
+        # Mock _refresh_deployed_items to avoid API calls in all tests using this fixture
+        mock_ws._refresh_deployed_items = MagicMock()
+        return mock_ws
+
+    def test_extract_find_value(self):
+        """Tests extract_find_value with string."""
+        # Test with plain text
+        param_dict = {"find_value": "test-value"}
+        expected = {"pattern": "test-value", "is_regex": False, "has_matches": True}
+        assert extract_find_value(param_dict, "content with test-value", True) == expected
+        expected_no_match = {"pattern": "test-value", "is_regex": False, "has_matches": False}
+        assert extract_find_value(param_dict, "unrelated content", True) == expected_no_match
+
+    def test_extract_find_value_valid_regex(self):
+        """Tests extract_find_value with regex pattern."""
+        param_dict = {"find_value": "id=([\\w-]+)", "is_regex": "true"}
+
+        # Test with regex
+        expected = {"pattern": "id=([\\w-]+)", "is_regex": True, "has_matches": True}
+        assert extract_find_value(param_dict, "content with id=abc-123", True) == expected
+        # Test with non-matching regex
+        expected_no_match = {"pattern": "id=([\\w-]+)", "is_regex": True, "has_matches": False}
+        assert extract_find_value(param_dict, "unrelated content", True) == expected_no_match
+        # Test with regex but filter_match=False - should still return is_regex=True
+        expected = {"pattern": "id=([\\w-]+)", "is_regex": True, "has_matches": False}
+        assert extract_find_value(param_dict, "content with id=abc-123", False) == expected
+
+    def test_extract_find_value_invalid_regex(self):
+        """Tests extract_find_value with invalid regex capturing groups."""
+        # Test with regex that has no capturing groups
+        param_dict = {"find_value": "id=\\w+", "is_regex": "true"}
+        with pytest.raises(InputError):
+            extract_find_value(param_dict, "content with id=abc123", True)
+
+        # Test with regex that has multiple capturing groups
+        param_dict = {"find_value": "(id)=([\\w-]+)", "is_regex": "true"}
+        with pytest.raises(InputError):
+            extract_find_value(param_dict, "content with id=abc-123", True)
+
+        # Test with regex that captures empty value
+        param_dict = {"find_value": "id=()", "is_regex": "true"}
+        with pytest.raises(InputError):
+            extract_find_value(param_dict, "content with id=", True)
+
+        # Test that structure validation happens even when there are no matches
+        # (regex with no capturing groups should still fail even if no matches)
+        param_dict = {"find_value": "id=\\w+", "is_regex": "true"}
+        with pytest.raises(InputError):
+            extract_find_value(param_dict, "unrelated content without matches", True)
+
+        # Test that structure validation happens with filter_match=False too
+        param_dict = {"find_value": "(id)=([\\w-]+)", "is_regex": "true"}
+        with pytest.raises(InputError):
+            extract_find_value(param_dict, "unrelated content without matches", False)
+
+    def test_extract_find_value_multiple_matches(self):
+        """Tests extract_find_value with regex pattern that has multiple matches."""
+        param_dict = {"find_value": "id=([\\w-]+)", "is_regex": "true"}
+
+        # Test with multiple matches in content - now returns simple dict format
+        content_with_multiple = "content with id=abc-123 and id=def-456 and id=ghi-789"
+        result = extract_find_value(param_dict, content_with_multiple, True)
+        expected = {"pattern": "id=([\\w-]+)", "is_regex": True, "has_matches": True}
+        assert result == expected
+
+        # Test that content is detected as having matches
+        content_with_duplicates = "content with id=abc-123 and id=def-456 and id=abc-123"
+        result = extract_find_value(param_dict, content_with_duplicates, True)
+        expected = {"pattern": "id=([\\w-]+)", "is_regex": True, "has_matches": True}
+        assert result == expected
+
+    def test_extract_replace_value_default(self, mock_workspace):
+        """Tests extract_replace_value with different inputs, get_dataflow_name=False."""
+        # Regular string should be returned as is
+        assert extract_replace_value(mock_workspace, "literal string") == "literal string"
+
+        # Workspace ID variable should return the workspace ID
+        assert extract_replace_value(mock_workspace, "$workspace.id", False) == "mock-workspace-id"
+
+        # Workspace ID variable should return the workspace ID
+        assert extract_replace_value(mock_workspace, "$workspace.$id", False) == "mock-workspace-id"
+
+        # Workspace name variable should resolve to workspace ID
+        with mock.patch("fabric_cicd._parameter._utils._extract_workspace_id") as mock_extract_ws:
+            mock_extract_ws.return_value = "resolved-workspace-id"
+            result = extract_replace_value(mock_workspace, "$workspace.dev")
+            assert result == "resolved-workspace-id"
+            mock_extract_ws.assert_called_once_with(mock_workspace, "$workspace.dev")
+
+        # Item attribute variables should extract values from workspace items
+        with mock.patch("fabric_cicd._parameter._utils._extract_item_attribute") as mock_extract:
+            mock_extract.return_value = "notebook-id"
+            result = extract_replace_value(mock_workspace, "$items.Notebook.Test Notebook.id")
+            assert result == "notebook-id"
+            mock_extract.assert_called_once_with(mock_workspace, "$items.Notebook.Test Notebook.id", False)
+
+    def test_extract_replace_value_get_dataflow_name(self, mock_workspace):
+        """Tests extract_replace_value with different inputs, get_dataflow_name=True."""
+        # With get_dataflow_name=True for regular string, should return None
+        assert extract_replace_value(mock_workspace, "literal string", True) is None
+
+        # With get_dataflow_name=True for workspace ID, should return an error
+        with pytest.raises(
+            InputError,
+            match=re.escape(
+                "Invalid replace_value variable: '$workspace'. Expected format to get dataflow name: $items.type.name.attribute"
+            ),
+        ):
+            result = extract_replace_value(mock_workspace, "$workspace.id", True)
+
+        # With get_dataflow_name=True for non-Dataflow item, should return None
+        with mock.patch("fabric_cicd._parameter._utils._extract_item_attribute") as mock_extract:
+            mock_extract.return_value = None
+            result = extract_replace_value(mock_workspace, "$items.Notebook.Test Notebook.id", True)
+            assert result == None
+            mock_extract.assert_called_once_with(mock_workspace, "$items.Notebook.Test Notebook.id", True)
+
+        # With get_dataflow_name=True for a Dataflow item, should return the Dataflow name
+        with mock.patch("fabric_cicd._parameter._utils._extract_item_attribute") as mock_extract:
+            mock_extract.return_value = "Source Dataflow"
+            result = extract_replace_value(mock_workspace, "$items.Dataflow.Source Dataflow.id", True)
+            assert result == "Source Dataflow"
+            mock_extract.assert_called_once_with(mock_workspace, "$items.Dataflow.Source Dataflow.id", True)
+
+    def test_extract_item_attribute_valid(self, mock_workspace):
+        """Tests _extract_item_attribute with valid variables."""
+        # Test with valid notebook item
+        result = _extract_item_attribute(mock_workspace, "$items.Notebook.Test Notebook.id", False)
+        assert result == "notebook-id"
+        result = _extract_item_attribute(mock_workspace, "$items.Notebook.Test Notebook.$id", False)
+        assert result == "notebook-id"
+
+        # Test with valid lakehouse item
+        result = _extract_item_attribute(mock_workspace, "$items.Lakehouse.Test_Lakehouse.sqlendpoint", False)
+        assert result == "lakehouse-endpoint"
+        result = _extract_item_attribute(mock_workspace, "$items.Lakehouse.Test_Lakehouse.$sqlendpoint", False)
+        assert result == "lakehouse-endpoint"
+
+        # Test with valid lakehouse sqlendpointid attribute
+        result = _extract_item_attribute(mock_workspace, "$items.Lakehouse.Test_Lakehouse.sqlendpointid", False)
+        assert result == "lakehouse-sql-endpoint-id"
+        result = _extract_item_attribute(mock_workspace, "$items.Lakehouse.Test_Lakehouse.$sqlendpointid", False)
+        assert result == "lakehouse-sql-endpoint-id"
+
+        # Test with valid warehouse item
+        result = _extract_item_attribute(mock_workspace, "$items.Warehouse.TestWarehouse.id", False)
+        assert result == "warehouse-id"
+        result = _extract_item_attribute(mock_workspace, "$items.Warehouse.TestWarehouse.$id", False)
+        assert result == "warehouse-id"
+
+        # Test with valid SQLDatabase item
+        result = _extract_item_attribute(mock_workspace, "$items.SQLDatabase.TestSQLDatabase.sqlendpoint", False)
+        assert result == "test-sql-server.database.fabric.microsoft.com,1433"
+        result = _extract_item_attribute(mock_workspace, "$items.SQLDatabase.TestSQLDatabase.$sqlendpoint", False)
+        assert result == "test-sql-server.database.fabric.microsoft.com,1433"
+
+        # Test with valid eventhouse item
+        result = _extract_item_attribute(mock_workspace, "$items.Eventhouse.Test Eventhouse.queryserviceuri", False)
+        assert result == "eventhouse-query-uri"
+        result = _extract_item_attribute(mock_workspace, "$items.Eventhouse.Test Eventhouse.$queryserviceuri", False)
+        assert result == "eventhouse-query-uri"
+
+    def test_extract_item_attribute_invalid(self, mock_workspace):
+        """Tests _extract_item_attribute with invalid variable cases."""
+        # Test with invalid syntax
+        with pytest.raises(ParsingError, match="Invalid \\$items variable syntax"):
+            _extract_item_attribute(mock_workspace, "$items.Notebook", False)
+        with pytest.raises(ParsingError, match="Invalid \\$items variable syntax"):
+            _extract_item_attribute(mock_workspace, "$items.Notebook.Test Notebook", False)
+
+        # Test with too many segments - now check for invalid attribute instead of invalid syntax
+        mock_items_attr_lookup = list(constants.ITEM_ATTR_LOOKUP)
+        with pytest.raises(
+            ParsingError,
+            match=re.escape(f"Attribute 'extra' is invalid. Supported attributes: {mock_items_attr_lookup}"),
+        ):
+            _extract_item_attribute(mock_workspace, "$items.Notebook.Test Notebook.id.extra", False)
+
+    def test_extract_item_attribute_get_dataflow_name(self, mock_workspace):
+        """Test _extract_item_attribute with special handling for Dataflow references."""
+        # Test when Dataflow references another Dataflow in the repository
+        result = _extract_item_attribute(mock_workspace, "$items.Dataflow.Source Dataflow.id", True)
+        assert result == "Source Dataflow"
+
+        # Test when source Dataflow doesn't exist in repository - should return None
+        result = _extract_item_attribute(mock_workspace, "$items.Dataflow.NonExistentDataflow.id", True)
+        assert result is None
+
+        # Test when source Dataflow type doesn't match (case sensitive) - should return None
+        result = _extract_item_attribute(mock_workspace, "$items.dataflow.Source Dataflow.id", get_dataflow_name=True)
+        assert result is None
+
+        # Test when source Dataflow name doesn't match (case sensitive) - should return None
+        result = _extract_item_attribute(mock_workspace, "$items.Dataflow.source dataflow.id", get_dataflow_name=True)
+        assert result is None
+
+    def test_extract_item_attribute_warns_legacy_format(self, mock_workspace, caplog):
+        """Tests that _extract_item_attribute warns when using legacy format."""
+        # import logging
+
+        # Use the caplog fixture to capture log messages
+        with caplog.at_level(logging.WARNING):
+            # Call the function with the legacy format
+            result = _extract_item_attribute(mock_workspace, "$items.Notebook.Test Notebook.id", False)
+
+            # Assert that the result is as expected
+            assert result == "notebook-id"
+
+            # Check that the warning message was logged
+            expected_warning = (
+                "The $items variable format has changed. Please update to the new format: $items.type.name.$attribute"
+            )
+            assert expected_warning in caplog.text
+
+        # Clear the log and test that the warning doesn't appear with new format
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            # Call the function with the new format
+            result = _extract_item_attribute(mock_workspace, "$items.Notebook.Test Notebook.$id", False)
+
+            # Assert that the result is still as expected
+            assert result == "notebook-id"
+
+            # Check that no warning was logged
+            assert expected_warning not in caplog.text
+
+    def test_extract_workspace_id_direct(self, mock_workspace):
+        """Tests _extract_workspace_id with direct workspace ID variable."""
+        from fabric_cicd._parameter._utils import _extract_workspace_id
+
+        # Test with $workspace.id - should return workspace_id directly
+        result = _extract_workspace_id(mock_workspace, "$workspace.id")
+        assert result == "mock-workspace-id"
+
+        result = _extract_workspace_id(mock_workspace, "$workspace.$id")
+        assert result == "mock-workspace-id"
+
+    def test_extract_workspace_id_resolve(self, mock_workspace):
+        """Tests _extract_workspace_id with workspace name resolution."""
+        from fabric_cicd._parameter._utils import _extract_workspace_id
+
+        # Mock the _resolve_workspace_id method
+        mock_workspace._resolve_workspace_id.return_value = "resolved-workspace-id"
+
+        # Test with $workspace.name - should resolve the workspace ID from name
+        result = _extract_workspace_id(mock_workspace, "$workspace.test_workspace")
+        assert result == "resolved-workspace-id"
+        mock_workspace._resolve_workspace_id.assert_called_once_with("test_workspace")
+
+    def test_extract_workspace_id_resolve_error(self, mock_workspace):
+        """Tests _extract_workspace_id when workspace name resolution fails."""
+        from fabric_cicd._parameter._utils import _extract_workspace_id
+
+        # Mock the _resolve_workspace_id method to raise InputError
+        mock_workspace._resolve_workspace_id.side_effect = InputError("Workspace name not found", logger)
+
+        # Should re-raise the same InputError
+        with pytest.raises(InputError, match=r"Workspace name not found"):
+            _extract_workspace_id(mock_workspace, "$workspace.unknown_workspace")
+
+    def test_extract_workspace_id_general_error(self, mock_workspace):
+        """Tests _extract_workspace_id with unexpected errors."""
+        from fabric_cicd._parameter._utils import _extract_workspace_id
+
+        # Mock the _resolve_workspace_id method to raise a general exception
+        mock_workspace._resolve_workspace_id.side_effect = Exception("Unexpected error")
+
+        # Should wrap general exceptions in ParsingError
+        with pytest.raises(ParsingError, match=r"Error parsing \$workspace variable"):
+            _extract_workspace_id(mock_workspace, "$workspace.test_workspace")
+
+    def test_extract_item_attribute_null_return(self, mock_workspace):
+        """Tests _extract_item_attribute cases that return None."""
+        # Test with non-Dataflow item in get_dataflow_name mode should return None
+        result = _extract_item_attribute(mock_workspace, "$items.Lakehouse.Test Lakehouse.id", True)
+        assert result is None
+
+        # Test with Dataflow item, but incorrect attribute should return None
+        result = _extract_item_attribute(mock_workspace, "$items.Dataflow.Source Dataflow.sqlendpoint", True)
+        assert result is None
+
+    def test_extract_item_attribute_invalid_attribute(self, mock_workspace):
+        """Tests _extract_item_attribute with invalid attribute."""
+        # Test with invalid attribute
+        mock_items_attr_lookup = list(constants.ITEM_ATTR_LOOKUP)
+        with pytest.raises(
+            ParsingError,
+            match=re.escape(f"Attribute 'guid' is invalid. Supported attributes: {mock_items_attr_lookup}"),
+        ):
+            _extract_item_attribute(mock_workspace, "$items.Dataflow.Source Dataflow.guid", True)
+
+    def test_extract_workspace_id_with_item_lookup(self, mock_workspace):
+        """Tests _extract_workspace_id with item lookup in another workspace."""
+        from fabric_cicd._parameter._utils import _extract_workspace_id
+
+        # Mock the _resolve_workspace_id method
+        mock_workspace._resolve_workspace_id.return_value = "resolved-workspace-id"
+
+        # Mock the _lookup_item_attribute method
+        mock_workspace._lookup_item_attribute = mock.MagicMock(return_value="item-123-id")
+
+        # Test with $workspace.<name>.$items.<item_type>.<item_name>.$id format
+        result = _extract_workspace_id(mock_workspace, "$workspace.test_workspace.$items.Notebook.Test Notebook.$id")
+
+        assert result == "item-123-id"
+        mock_workspace._resolve_workspace_id.assert_called_once_with("test_workspace")
+        # attribute should be passed without leading '$'
+        mock_workspace._lookup_item_attribute.assert_called_once_with(
+            "resolved-workspace-id", "Notebook", "Test Notebook", "id"
+        )
+
+    def test_extract_workspace_id_with_item_lookup_not_found(self, mock_workspace):
+        """Tests _extract_workspace_id when item lookup fails."""
+        from fabric_cicd._parameter._utils import _extract_workspace_id
+
+        # Mock the _resolve_workspace_id method
+        mock_workspace._resolve_workspace_id.return_value = "resolved-workspace-id"
+
+        # Mock the _lookup_item_attribute method to raise InputError (item not found)
+        error_msg = (
+            "Failed to look up item in workspace: resolved-workspace-id, item_type: Notebook, item_name: Test Notebook"
+        )
+        mock_workspace._lookup_item_attribute = mock.MagicMock(side_effect=InputError(error_msg, logger))
+
+        # Should re-raise the InputError
+        with pytest.raises(InputError, match=re.escape(error_msg)):
+            _extract_workspace_id(mock_workspace, "$workspace.test_workspace.$items.Notebook.Test Notebook.$id")
+
+        mock_workspace._resolve_workspace_id.assert_called_once_with("test_workspace")
+        mock_workspace._lookup_item_attribute.assert_called_once_with(
+            "resolved-workspace-id", "Notebook", "Test Notebook", "id"
+        )
+
+    @pytest.mark.parametrize(
+        "invalid_var",
+        [
+            "$workspace.$items.Notebook.Test Notebook.$id",  # Missing workspace name
+            "$workspace.test_workspace.$items.InvalidType.Test Notebook.$id",  # Invalid item type
+            "$workspace.test_workspace.$items.Notebook.$id",  # Missing item name
+        ],
+    )
+    def test_extract_workspace_id_with_item_lookup_invalid_format(self, mock_workspace, invalid_var):
+        """Tests _extract_workspace_id with invalid item lookup format."""
+        from fabric_cicd._parameter._utils import _extract_workspace_id
+
+        # Test with invalid formats
+        with pytest.raises(ParsingError):
+            _extract_workspace_id(mock_workspace, invalid_var)
+
+    def test_extract_workspace_id_with_item_lookup_sqlendpoint(self, mock_workspace):
+        """Tests _extract_workspace_id resolves sqlendpoint from another workspace via $items reference."""
+        from fabric_cicd._parameter._utils import _extract_workspace_id
+
+        mock_workspace._resolve_workspace_id.return_value = "resolved-workspace-id"
+        mock_workspace._lookup_item_attribute = mock.MagicMock(return_value="lakehouse-endpoint-value")
+
+        result = _extract_workspace_id(
+            mock_workspace, "$workspace.test_workspace.$items.Lakehouse.Test_Lakehouse.$sqlendpoint"
+        )
+
+        assert result == "lakehouse-endpoint-value"
+        mock_workspace._resolve_workspace_id.assert_called_once_with("test_workspace")
+        mock_workspace._lookup_item_attribute.assert_called_once_with(
+            "resolved-workspace-id", "Lakehouse", "Test_Lakehouse", "sqlendpoint"
+        )
+
+    def test_extract_workspace_id_with_item_lookup_queryserviceuri(self, mock_workspace):
+        """Tests _extract_workspace_id resolves queryserviceuri from another workspace via $items reference."""
+        from fabric_cicd._parameter._utils import _extract_workspace_id
+
+        mock_workspace._resolve_workspace_id.return_value = "resolved-workspace-id"
+        mock_workspace._lookup_item_attribute = mock.MagicMock(return_value="eventhouse-query-uri-value")
+
+        result = _extract_workspace_id(
+            mock_workspace, "$workspace.test_workspace.$items.Eventhouse.Test Eventhouse.$queryserviceuri"
+        )
+
+        assert result == "eventhouse-query-uri-value"
+        mock_workspace._resolve_workspace_id.assert_called_once_with("test_workspace")
+        mock_workspace._lookup_item_attribute.assert_called_once_with(
+            "resolved-workspace-id", "Eventhouse", "Test Eventhouse", "queryserviceuri"
+        )
+
+    def test_extract_workspace_id_with_item_lookup_sqlendpointid(self, mock_workspace):
+        """Tests _extract_workspace_id resolves sqlendpointid from another workspace via $items reference."""
+        from fabric_cicd._parameter._utils import _extract_workspace_id
+
+        mock_workspace._resolve_workspace_id.return_value = "resolved-workspace-id"
+        mock_workspace._lookup_item_attribute = mock.MagicMock(return_value="lakehouse-sql-endpoint-id-value")
+
+        result = _extract_workspace_id(
+            mock_workspace, "$workspace.test_workspace.$items.Lakehouse.Test_Lakehouse.$sqlendpointid"
+        )
+
+        assert result == "lakehouse-sql-endpoint-id-value"
+        mock_workspace._resolve_workspace_id.assert_called_once_with("test_workspace")
+        mock_workspace._lookup_item_attribute.assert_called_once_with(
+            "resolved-workspace-id", "Lakehouse", "Test_Lakehouse", "sqlendpointid"
+        )
+
+    def test_extract_parameter_filters(self, mock_workspace):
+        """Tests extract_parameter_filters function."""
+        # Test with all filters
+        param_dict = {"item_type": "Notebook", "item_name": "TestNotebook", "file_path": "path/to/file.txt"}
+
+        with mock.patch("fabric_cicd._parameter._utils.process_input_path") as mock_process:
+            # Return a list of Path objects as expected
+            processed_path = Path("processed/path")
+            mock_process.return_value = [processed_path]
+            item_type, item_name, file_path = extract_parameter_filters(mock_workspace, param_dict)
+
+            assert item_type == "Notebook"
+            assert item_name == "TestNotebook"
+            # Assert that file_path is a list containing the processed path
+            assert file_path == [processed_path]
+            mock_process.assert_called_once_with(mock_workspace.repository_directory, "path/to/file.txt")
+
+        # Test with missing filters
+        param_dict = {}
+        with mock.patch("fabric_cicd._parameter._utils.process_input_path") as mock_process:
+            # When no file_path in param_dict, process_input_path should return an empty list
+            mock_process.return_value = []
+            item_type, item_name, file_path = extract_parameter_filters(mock_workspace, param_dict)
+
+            assert item_type is None
+            assert item_name is None
+            assert file_path == []
+
+    def test_check_parameter_structure(self):
+        """Tests _check_parameter_structure function."""
+        # Test with valid list
+        assert _check_parameter_structure([1, 2, 3]) is True
+        assert _check_parameter_structure([]) is True
+
+        # Test with invalid types
+        assert _check_parameter_structure("string") is False
+        assert _check_parameter_structure(123) is False
+        assert _check_parameter_structure({"key": "value"}) is False
+        assert _check_parameter_structure(None) is False
+
+    def test_is_valid_structure(self):
+        """Tests is_valid_structure function."""
+        # Test with valid structures
+        valid_dict = {
+            "find_replace": [{"find_value": "test"}],
+            "key_value_replace": [{"find_key": "$.test"}],
+            "spark_pool": [{"instance_pool_id": "test"}],
+            "semantic_model_binding": [{"connection_id": "test"}],
+        }
+        assert is_valid_structure(valid_dict) is True
+        assert is_valid_structure(valid_dict, "find_replace") is True
+
+        # Test with invalid structures
+        invalid_dict = {
+            "find_replace": "not a list",
+            "key_value_replace": [{"find_key": "$.test"}],
+            "semantic_model_binding": "not a list",
+        }
+        assert is_valid_structure(invalid_dict) is False
+        assert is_valid_structure(invalid_dict, "find_replace") is False
+
+        # Test with missing parameters
+        missing_dict = {
+            "unknown_param": [{"test": "value"}],
+        }
+        assert is_valid_structure(missing_dict) is False
+
+        # Test with empty dict
+        assert is_valid_structure({}) is False
+
+    def test_is_valid_structure_semantic_model_binding_new_format(self):
+        """Tests is_valid_structure with new dictionary format for semantic_model_binding."""
+        # New format with default and models
+        valid_new_format = {
+            "semantic_model_binding": {
+                "default": {
+                    "connection_id": {
+                        "PPE": "76e05dfe-9855-4e3d-a410-1dda048dbe99",
+                    }
+                },
+                "models": [
+                    {
+                        "semantic_model_name": ["Model1", "Model2"],
+                        "connection_id": {
+                            "PPE": "f96870d5-5f86-49ad-bf41-5967fd7c1c6d",
+                        },
+                    }
+                ],
+            }
+        }
+        assert is_valid_structure(valid_new_format) is True
+        assert is_valid_structure(valid_new_format, "semantic_model_binding") is True
+
+        # New format with only default
+        valid_default_only = {
+            "semantic_model_binding": {"default": {"connection_id": {"_ALL_": "76e05dfe-9855-4e3d-a410-1dda048dbe99"}}}
+        }
+        assert is_valid_structure(valid_default_only) is True
+
+        # New format with only models
+        valid_models_only = {
+            "semantic_model_binding": {
+                "models": [
+                    {
+                        "semantic_model_name": "SingleModel",
+                        "connection_id": {"DEV": "76e05dfe-9855-4e3d-a410-1dda048dbe99"},
+                    }
+                ]
+            }
+        }
+        assert is_valid_structure(valid_models_only) is True
+
+        # String is invalid
+        invalid_string = {"semantic_model_binding": "not valid"}
+        assert is_valid_structure(invalid_string) is False
+
+        # Empty dict is invalid (no bindings configured)
+        invalid_empty = {"semantic_model_binding": {}}
+        assert is_valid_structure(invalid_empty) is False
+
+    @mock.patch("fabric_cicd._parameter._parameter.Parameter")
+    @mock.patch("fabric_cicd._common._validate_input.validate_repository_directory")
+    @mock.patch("fabric_cicd._common._validate_input.validate_item_type_in_scope")
+    @mock.patch("fabric_cicd._common._validate_input.validate_environment")
+    def test_validate_parameter_file(self, mock_validate_env, mock_validate_item_type, mock_validate_repo, mock_param):
+        """Tests validate_parameter_file function with default parameters."""
+        # Setup mocks
+        mock_validate_repo.return_value = Path("/mock/repo")
+        mock_validate_item_type.return_value = ["Notebook", "Lakehouse"]
+        mock_validate_env.return_value = "Test"
+        mock_param_instance = mock.MagicMock()
+        mock_param.return_value = mock_param_instance
+        mock_param_instance._validate_parameter_file.return_value = True
+
+        # Call the function
+        from fabric_cicd._parameter._utils import validate_parameter_file
+
+        # Patch the FabricEndpoint inside the test since we need it to run successfully
+        with mock.patch("fabric_cicd._common._fabric_endpoint.FabricEndpoint", return_value=mock.MagicMock()):
+            result = validate_parameter_file(
+                repository_directory=Path("/mock/repo"),
+                item_type_in_scope=["Notebook", "Lakehouse"],
+                environment="Test",
+            )
+
+        # Verify the result
+        assert result is True
+        mock_param.assert_called_once_with(
+            repository_directory=Path("/mock/repo"),
+            item_type_in_scope=["Notebook", "Lakehouse"],
+            environment="Test",
+            parameter_file_name="parameter.yml",
+            parameter_file_path=None,
+        )
+        mock_param_instance._validate_parameter_file.assert_called_once()
+
+    @mock.patch("fabric_cicd._parameter._parameter.Parameter")
+    @mock.patch("fabric_cicd._common._validate_input.validate_repository_directory")
+    @mock.patch("fabric_cicd._common._validate_input.validate_item_type_in_scope")
+    @mock.patch("fabric_cicd._common._validate_input.validate_environment")
+    def test_validate_parameter_file_with_custom_file_name(
+        self, mock_validate_env, mock_validate_item_type, mock_validate_repo, mock_param
+    ):
+        """Tests validate_parameter_file function with custom parameter file name."""
+        # Setup mocks
+        mock_validate_repo.return_value = Path("/mock/repo")
+        mock_validate_item_type.return_value = ["Notebook", "Lakehouse"]
+        mock_validate_env.return_value = "Test"
+        mock_param_instance = mock.MagicMock()
+        mock_param.return_value = mock_param_instance
+        mock_param_instance._validate_parameter_file.return_value = True
+
+        # Call the function
+        from fabric_cicd._parameter._utils import validate_parameter_file
+
+        # Patch the FabricEndpoint inside the test since we need it to run successfully
+        with mock.patch("fabric_cicd._common._fabric_endpoint.FabricEndpoint", return_value=mock.MagicMock()):
+            result = validate_parameter_file(
+                repository_directory=Path("/mock/repo"),
+                item_type_in_scope=["Notebook", "Lakehouse"],
+                environment="Test",
+                parameter_file_name="custom_params.yml",
+            )
+
+        # Verify the result
+        assert result is True
+        mock_param.assert_called_once_with(
+            repository_directory=Path("/mock/repo"),
+            item_type_in_scope=["Notebook", "Lakehouse"],
+            environment="Test",
+            parameter_file_name="custom_params.yml",
+            parameter_file_path=None,
+        )
+        mock_param_instance._validate_parameter_file.assert_called_once()
+
+    @mock.patch("fabric_cicd._parameter._parameter.Parameter")
+    @mock.patch("fabric_cicd._common._validate_input.validate_repository_directory")
+    @mock.patch("fabric_cicd._common._validate_input.validate_item_type_in_scope")
+    @mock.patch("fabric_cicd._common._validate_input.validate_environment")
+    def test_validate_parameter_file_with_custom_file_path(
+        self, mock_validate_env, mock_validate_item_type, mock_validate_repo, mock_param
+    ):
+        """Tests validate_parameter_file function with custom parameter file path."""
+        # Setup mocks
+        mock_validate_repo.return_value = Path("/mock/repo")
+        mock_validate_item_type.return_value = ["Notebook", "Lakehouse"]
+        mock_validate_env.return_value = "Test"
+        mock_param_instance = mock.MagicMock()
+        mock_param.return_value = mock_param_instance
+        mock_param_instance._validate_parameter_file.return_value = True
+
+        # Call the function
+        from fabric_cicd._parameter._utils import validate_parameter_file
+
+        # Patch the FabricEndpoint inside the test since we need it to run successfully
+        with mock.patch("fabric_cicd._common._fabric_endpoint.FabricEndpoint", return_value=mock.MagicMock()):
+            result = validate_parameter_file(
+                repository_directory=Path("/mock/repo"),
+                item_type_in_scope=["Notebook", "Lakehouse"],
+                environment="Test",
+                parameter_file_path="/custom/path/to/parameters.yml",
+            )
+
+        # Verify the result
+        assert result is True
+        mock_param.assert_called_once_with(
+            repository_directory=Path("/mock/repo"),
+            item_type_in_scope=["Notebook", "Lakehouse"],
+            environment="Test",
+            parameter_file_name="parameter.yml",
+            parameter_file_path="/custom/path/to/parameters.yml",
+        )
+        mock_param_instance._validate_parameter_file.assert_called_once()
+
+    @mock.patch("fabric_cicd._parameter._parameter.Parameter")
+    @mock.patch("fabric_cicd._common._validate_input.validate_repository_directory")
+    @mock.patch("fabric_cicd._common._validate_input.validate_item_type_in_scope")
+    @mock.patch("fabric_cicd._common._validate_input.validate_environment")
+    def test_validate_parameter_file_with_both_custom_name_and_path(
+        self, mock_validate_env, mock_validate_item_type, mock_validate_repo, mock_param
+    ):
+        """Tests validate_parameter_file function with both custom file name and path."""
+        # Setup mocks
+        mock_validate_repo.return_value = Path("/mock/repo")
+        mock_validate_item_type.return_value = ["Notebook", "Lakehouse"]
+        mock_validate_env.return_value = "Test"
+        mock_param_instance = mock.MagicMock()
+        mock_param.return_value = mock_param_instance
+        mock_param_instance._validate_parameter_file.return_value = True
+
+        # Call the function
+        from fabric_cicd._parameter._utils import validate_parameter_file
+
+        # Patch the FabricEndpoint inside the test since we need it to run successfully
+        with mock.patch("fabric_cicd._common._fabric_endpoint.FabricEndpoint", return_value=mock.MagicMock()):
+            result = validate_parameter_file(
+                repository_directory=Path("/mock/repo"),
+                item_type_in_scope=["Notebook", "Lakehouse"],
+                environment="Test",
+                parameter_file_name="custom_params.yml",
+                parameter_file_path="/custom/path/to/parameters.yml",
+            )
+
+        # Verify the result
+        assert result is True
+        mock_param.assert_called_once_with(
+            repository_directory=Path("/mock/repo"),
+            item_type_in_scope=["Notebook", "Lakehouse"],
+            environment="Test",
+            parameter_file_name="custom_params.yml",
+            parameter_file_path="/custom/path/to/parameters.yml",
+        )
+        mock_param_instance._validate_parameter_file.assert_called_once()
+
+    @mock.patch("fabric_cicd._parameter._parameter.Parameter")
+    @mock.patch("fabric_cicd._common._validate_input.validate_repository_directory")
+    @mock.patch("fabric_cicd._common._validate_input.validate_item_type_in_scope")
+    @mock.patch("fabric_cicd._common._validate_input.validate_environment")
+    def test_validate_parameter_file_with_none_item_type_in_scope(
+        self, mock_validate_env, mock_validate_item_type, mock_validate_repo, mock_param
+    ):
+        """Tests validate_parameter_file function when item_type_in_scope is omitted (None)."""
+        # Setup mocks
+        mock_validate_repo.return_value = Path("/mock/repo")
+        # Mock validate_item_type_in_scope to return all supported types when None is passed
+        mock_validate_item_type.return_value = list(constants.ACCEPTED_ITEM_TYPES)
+        mock_validate_env.return_value = "Test"
+        mock_param_instance = mock.MagicMock()
+        mock_param.return_value = mock_param_instance
+        mock_param_instance._validate_parameter_file.return_value = True
+
+        # Call the function
+        from fabric_cicd._parameter._utils import validate_parameter_file
+
+        # Patch the FabricEndpoint inside the test since we need it to run successfully
+        with mock.patch("fabric_cicd._common._fabric_endpoint.FabricEndpoint", return_value=mock.MagicMock()):
+            result = validate_parameter_file(
+                repository_directory=Path("/mock/repo"),
+                environment="Test",
+            )
+
+        # Verify the result
+        assert result is True
+        # Verify that validate_item_type_in_scope was called with None
+        mock_validate_item_type.assert_called_once_with(None)
+        # Verify Parameter was called with all supported item types
+        mock_param.assert_called_once_with(
+            repository_directory=Path("/mock/repo"),
+            item_type_in_scope=list(constants.ACCEPTED_ITEM_TYPES),
+            environment="Test",
+            parameter_file_name="parameter.yml",
+            parameter_file_path=None,
+        )
+        mock_param_instance._validate_parameter_file.assert_called_once()
+
+    def test_find_match(self):
+        """Tests _find_match function with various inputs."""
+        # Test with None param_value
+        assert _find_match(None, "value") is True
+
+        # Test with string param_value
+        assert _find_match("value", "value") is True
+        assert _find_match("value", "other") is False
+
+        # Test with list param_value
+        assert _find_match(["value1", "value2"], "value1") is True
+        assert _find_match(["value1", "value2"], "value3") is False
+
+        # Test with list of Paths
+        path_list = [Path("test1.txt"), Path("test2.txt")]
+        assert _find_match(path_list, Path("test1.txt")) is True
+        assert _find_match(path_list, Path("test3.txt")) is False
+
+        # Test with invalid type
+        assert _find_match(123, "value") is False
+
+    def test_check_replacement(self, temp_repository):
+        """Tests check_replacement function with various combinations of inputs."""
+        file_path = temp_repository / "file1.txt"
+
+        # Test with no filters
+        assert check_replacement(None, None, None, "type1", "name1", file_path) is True
+
+        # Test with matching filters
+        assert check_replacement("type1", "name1", [file_path], "type1", "name1", file_path) is True
+
+        # Test with non-matching filters
+        assert check_replacement("type2", "name1", [file_path], "type1", "name1", file_path) is False
+        assert check_replacement("type1", "name2", [file_path], "type1", "name1", file_path) is False
+        assert check_replacement("type1", "name1", [Path("other.txt")], "type1", "name1", file_path) is False
+
+        # Test with combination of matching/non-matching filters
+        assert check_replacement("type1", "name2", [file_path], "type1", "name1", file_path) is False
+        assert check_replacement("type1", "name1", [Path("other.txt")], "type1", "name1", file_path) is False
+
+    def test_replace_key_value_valid_json(self, mock_workspace):
+        """Tests replace_key_value with valid JSON content and environment."""
+        # Test JSON with server host configuration
+        test_json = '{"server": {"host": "localhost", "port": 8080}}'
+        param_dict = {
+            "find_key": "$.server.host",
+            "replace_value": {"dev": "dev-server.example.com", "prod": "prod-server.example.com"},
+        }
+
+        # Test successful replacement for dev environment
+        result = replace_key_value(mock_workspace, param_dict, test_json, "dev")
+        result_data = json.loads(result)
+        assert result_data["server"]["host"] == "dev-server.example.com"
+        assert result_data["server"]["port"] == 8080  # Verify other values unchanged
+
+        # Test successful replacement for prod environment
+        result = replace_key_value(mock_workspace, param_dict, test_json, "prod")
+        result_data = json.loads(result)
+        assert result_data["server"]["host"] == "prod-server.example.com"
+
+    def test_replace_key_value_environment_not_found(self, mock_workspace):
+        """Tests replace_key_value when environment is not in the replace_value dictionary."""
+        test_json = '{"server": {"host": "localhost", "port": 8080}}'
+        param_dict = {
+            "find_key": "$.server.host",
+            "replace_value": {"dev": "dev-server.example.com", "prod": "prod-server.example.com"},
+        }
+
+        # Test when environment not in replace_value
+        result = replace_key_value(mock_workspace, param_dict, test_json, "test")
+        result_data = json.loads(result)
+        assert result_data["server"]["host"] == "localhost"  # Original value unchanged
+
+    def test_replace_key_value_invalid_json(self, mock_workspace):
+        """Tests replace_key_value with invalid JSON content."""
+        invalid_json = "{invalid json content}"
+        param_dict = {"find_key": "$.server.host", "replace_value": {"dev": "test-server"}}
+
+        # JSONDecodeError will be raised for invalid JSON and wrapped in ValueError
+        with pytest.raises(ValueError, match="Expecting property name"):
+            replace_key_value(mock_workspace, param_dict, invalid_json, "dev")
+
+    def test_replace_key_value(self, mock_workspace):
+        """Test replace_key_value function with JSON content."""
+        # Create test parameter dictionary and JSON content
+        param_dict = {
+            "find_key": "$.server.host",
+            "replace_value": {"dev": "dev-server.example.com", "prod": "prod-server.example.com"},
+        }
+        json_content = '{"server": {"host": "localhost", "port": 8080}}'
+
+        # Test successful replacement
+        result = replace_key_value(mock_workspace, param_dict, json_content, "dev")
+
+        # Parse the JSON result and check the exact value (avoid substring sanitization issues)
+        result_json = json.loads(result)
+        assert result_json["server"]["host"] == "dev-server.example.com"
+
+        # Test with environment not in replace_value
+        result = replace_key_value(mock_workspace, param_dict, json_content, "test")
+        result_json = json.loads(result)
+        assert result_json["server"]["host"] == "localhost"
+
+        # Test with invalid JSON content
+        with pytest.raises(ValueError, match="Expecting property name"):
+            replace_key_value(mock_workspace, param_dict, "{invalid json}", "dev")
+
+    def test_replace_key_value_with_items_notation(self, mock_workspace):
+        """Test replace_key_value function with $items notation."""
+        # Mock the workspace to return item attributes
+        mock_workspace.workspace_items = {
+            "Lakehouse": {
+                "TestLakehouse": {
+                    "id": "test-lakehouse-id-12345",
+                    "sqlendpoint": "test-lakehouse.database.windows.net",
+                }
+            },
+            "Warehouse": {
+                "TestWarehouse": {
+                    "id": "test-warehouse-id-67890",
+                    "sqlendpoint": "test-warehouse.database.windows.net",
+                }
+            },
+        }
+        mock_workspace._refresh_deployed_items = MagicMock()
+
+        # Test JSON with item references
+        test_json = '{"lakehouse": {"id": "placeholder-id", "endpoint": "placeholder-endpoint"}}'
+
+        # Test with $items notation for lakehouse id
+        param_dict = {
+            "find_key": "$.lakehouse.id",
+            "replace_value": {
+                "dev": "$items.Lakehouse.TestLakehouse.$id",
+                "prod": "$items.Lakehouse.TestLakehouse.$id",
+            },
+        }
+
+        # Test successful replacement with $items notation
+        result = replace_key_value(mock_workspace, param_dict, test_json, "dev")
+        result_data = json.loads(result)
+        assert result_data["lakehouse"]["id"] == "test-lakehouse-id-12345"
+        assert result_data["lakehouse"]["endpoint"] == "placeholder-endpoint"  # Unchanged
+
+        # Test with $items notation for sqlendpoint
+        param_dict = {
+            "find_key": "$.lakehouse.endpoint",
+            "replace_value": {
+                "dev": "$items.Lakehouse.TestLakehouse.$sqlendpoint",
+                "prod": "$items.Warehouse.TestWarehouse.$sqlendpoint",
+            },
+        }
+
+        result = replace_key_value(mock_workspace, param_dict, test_json, "dev")
+        result_data = json.loads(result)
+        assert result_data["lakehouse"]["endpoint"] == "test-lakehouse.database.windows.net"
+
+        result = replace_key_value(mock_workspace, param_dict, test_json, "prod")
+        result_data = json.loads(result)
+        assert result_data["lakehouse"]["endpoint"] == "test-warehouse.database.windows.net"
+
+    def test_replace_key_value_with_items_notation_and_non_string_values(self, mock_workspace):
+        """Test replace_key_value function with $items notation mixed with other value types."""
+        # Mock the workspace to return item attributes
+        mock_workspace.workspace_items = {
+            "Lakehouse": {
+                "TestLakehouse": {
+                    "id": "test-lakehouse-id-12345",
+                }
+            },
+        }
+        mock_workspace._refresh_deployed_items = MagicMock()
+
+        # Test JSON with mixed value types
+        test_json = '{"config": {"enabled": false, "count": 100, "lakehouse_id": "placeholder"}}'
+
+        # Test with boolean value (should not process as $items)
+        param_dict = {
+            "find_key": "$.config.enabled",
+            "replace_value": {"dev": True, "prod": False},
+        }
+
+        result = replace_key_value(mock_workspace, param_dict, test_json, "dev")
+        result_data = json.loads(result)
+        assert result_data["config"]["enabled"] is True
+
+        # Test with integer value (should not process as $items)
+        param_dict = {
+            "find_key": "$.config.count",
+            "replace_value": {"dev": 200, "prod": 300},
+        }
+
+        result = replace_key_value(mock_workspace, param_dict, test_json, "dev")
+        result_data = json.loads(result)
+        assert result_data["config"]["count"] == 200
+
+        # Test with string $items notation
+        param_dict = {
+            "find_key": "$.config.lakehouse_id",
+            "replace_value": {
+                "dev": "$items.Lakehouse.TestLakehouse.$id",
+                "prod": "$items.Lakehouse.TestLakehouse.$id",
+            },
+        }
+
+        result = replace_key_value(mock_workspace, param_dict, test_json, "dev")
+        result_data = json.loads(result)
+        assert result_data["config"]["lakehouse_id"] == "test-lakehouse-id-12345"
+
+    def test_replace_key_value_yaml_valid(self, mock_workspace):
+        """Tests replace_key_value_yaml with valid YAML content and environment."""
+        # Test YAML with server host configuration
+        test_yaml = """server:
+  host: localhost
+  port: 8080
+"""
+        param_dict = {
+            "find_key": "$.server.host",
+            "replace_value": {"dev": "dev-server.example.com", "prod": "prod-server.example.com"},
+        }
+
+        # Test successful replacement for dev environment
+        result = replace_key_value(mock_workspace, param_dict, test_yaml, "dev", is_yaml=True)
+        result_data = yaml.safe_load(result)
+        assert result_data["server"]["host"] == "dev-server.example.com"
+        assert result_data["server"]["port"] == 8080  # Verify other values unchanged
+
+        # Test successful replacement for prod environment
+        result = replace_key_value(mock_workspace, param_dict, test_yaml, "prod", is_yaml=True)
+        result_data = yaml.safe_load(result)
+        assert result_data["server"]["host"] == "prod-server.example.com"
+
+    def test_replace_key_value_yaml_environment_not_found(self, mock_workspace):
+        """Tests replace_key_value_yaml when environment is not in the replace_value dictionary."""
+        test_yaml = """server:
+  host: localhost
+  port: 8080
+"""
+        param_dict = {
+            "find_key": "$.server.host",
+            "replace_value": {"dev": "dev-server.example.com", "prod": "prod-server.example.com"},
+        }
+
+        # Test when environment not in replace_value
+        result = replace_key_value(mock_workspace, param_dict, test_yaml, "test", is_yaml=True)
+        result_data = yaml.safe_load(result)
+        assert result_data["server"]["host"] == "localhost"  # Original value unchanged
+
+    def test_replace_key_value_yaml_invalid(self, mock_workspace):
+        """Tests replace_key_value_yaml with invalid YAML content."""
+        invalid_yaml = "invalid: yaml: content: [unclosed"
+        param_dict = {"find_key": "$.server.host", "replace_value": {"dev": "test-server"}}
+
+        # YAMLError will be raised for invalid YAML and wrapped in ValueError
+        with pytest.raises(ValueError, match="mapping values are not allowed"):
+            replace_key_value(mock_workspace, param_dict, invalid_yaml, "dev", is_yaml=True)
+
+    def test_replace_key_value_yaml_empty_content(self, mock_workspace):
+        """Tests replace_key_value_yaml with empty YAML content."""
+        empty_yaml = ""
+        param_dict = {"find_key": "$.server.host", "replace_value": {"dev": "test-server"}}
+
+        # Empty YAML should return as-is
+        result = replace_key_value(mock_workspace, param_dict, empty_yaml, "dev", is_yaml=True)
+        assert result == empty_yaml
+
+    def test_replace_key_value_yaml_nested_structure(self, mock_workspace):
+        """Tests replace_key_value_yaml with nested YAML structure like SparkCompute.yml."""
+        # Test YAML similar to SparkCompute.yml
+        test_yaml = """enable_native_execution_engine: false
+driver_cores: 8
+driver_memory: 56g
+executor_cores: 8
+executor_memory: 56g
+dynamic_executor_allocation:
+  enabled: true
+  min_executors: 1
+  max_executors: 9
+runtime_version: "1.2"
+"""
+        # Test replacing a nested value
+        param_dict = {
+            "find_key": "$.dynamic_executor_allocation.max_executors",
+            "replace_value": {"dev": 5, "prod": 20},
+        }
+
+        result = replace_key_value(mock_workspace, param_dict, test_yaml, "dev", is_yaml=True)
+        result_data = yaml.safe_load(result)
+        assert result_data["dynamic_executor_allocation"]["max_executors"] == 5
+        assert result_data["dynamic_executor_allocation"]["min_executors"] == 1  # Unchanged
+
+        # Test replacing a top-level value
+        param_dict = {
+            "find_key": "$.driver_cores",
+            "replace_value": {"dev": 4, "prod": 16},
+        }
+
+        result = replace_key_value(mock_workspace, param_dict, test_yaml, "prod", is_yaml=True)
+        result_data = yaml.safe_load(result)
+        assert result_data["driver_cores"] == 16
+
+    def test_replace_key_value_yaml_with_items_notation(self, mock_workspace):
+        """Test replace_key_value_yaml function with $items notation."""
+        # Mock the workspace to return item attributes
+        mock_workspace.workspace_items = {
+            "Lakehouse": {
+                "TestLakehouse": {
+                    "id": "test-lakehouse-id-12345",
+                    "sqlendpoint": "test-lakehouse.database.windows.net",
+                }
+            },
+        }
+        mock_workspace._refresh_deployed_items = MagicMock()
+
+        # Test YAML with item references
+        test_yaml = """lakehouse:
+  id: placeholder-id
+  endpoint: placeholder-endpoint
+"""
+
+        # Test with $items notation for lakehouse id
+        param_dict = {
+            "find_key": "$.lakehouse.id",
+            "replace_value": {
+                "dev": "$items.Lakehouse.TestLakehouse.$id",
+                "prod": "$items.Lakehouse.TestLakehouse.$id",
+            },
+        }
+
+        # Test successful replacement with $items notation
+        result = replace_key_value(mock_workspace, param_dict, test_yaml, "dev", is_yaml=True)
+        result_data = yaml.safe_load(result)
+        assert result_data["lakehouse"]["id"] == "test-lakehouse-id-12345"
+        assert result_data["lakehouse"]["endpoint"] == "placeholder-endpoint"  # Unchanged
+
+    def test_replace_key_value_yaml_with_non_string_values(self, mock_workspace):
+        """Test replace_key_value_yaml function with non-string value types."""
+        # Test YAML with mixed value types
+        test_yaml = """config:
+  enabled: false
+  count: 100
+  threshold: 0.5
+  items:
+    - item1
+    - item2
+"""
+
+        # Test with boolean value
+        param_dict = {
+            "find_key": "$.config.enabled",
+            "replace_value": {"dev": True, "prod": False},
+        }
+
+        result = replace_key_value(mock_workspace, param_dict, test_yaml, "dev", is_yaml=True)
+        result_data = yaml.safe_load(result)
+        assert result_data["config"]["enabled"] is True
+
+        # Test with integer value
+        param_dict = {
+            "find_key": "$.config.count",
+            "replace_value": {"dev": 200, "prod": 300},
+        }
+
+        result = replace_key_value(mock_workspace, param_dict, test_yaml, "dev", is_yaml=True)
+        result_data = yaml.safe_load(result)
+        assert result_data["config"]["count"] == 200
+
+        # Test with float value
+        param_dict = {
+            "find_key": "$.config.threshold",
+            "replace_value": {"dev": 0.8, "prod": 0.95},
+        }
+
+        result = replace_key_value(mock_workspace, param_dict, test_yaml, "dev", is_yaml=True)
+        result_data = yaml.safe_load(result)
+        assert result_data["config"]["threshold"] == 0.8
+
+    def test_replace_variables_in_parameter_file(self, monkeypatch):
+        """Test replace_variables_in_parameter_file with feature flag enabled."""
+        # Set up test environment variables
+        test_env_vars = {
+            "$ENV:TEST_VAR": "test_value",
+            "$ENV:ANOTHER_VAR": "another_value",
+            "NORMAL_VAR": "normal_value",  # Should be ignored
+        }
+        # Mock os.environ
+        monkeypatch.setattr("os.environ", test_env_vars)
+
+        # Mock feature flag to be enabled
+        monkeypatch.setattr(constants, "FEATURE_FLAG", ["enable_environment_variable_replacement"])
+
+        # Test parameter file content with environment variables
+        test_content = """
+        parameter:
+          value: $ENV:TEST_VAR
+          other: $ENV:ANOTHER_VAR
+          normal: NORMAL_VAR
+        """
+        result = replace_variables_in_parameter_file(test_content)
+        # Verify replacements
+        assert "value: test_value" in result
+        assert "other: another_value" in result
+        assert "normal: NORMAL_VAR" in result  # Normal var unchanged
+
+    def test_replace_variables_in_parameter_file_feature_disabled(self, monkeypatch):
+        """Test replace_variables_in_parameter_file with feature flag disabled."""
+        # Set up test environment variables with $ENV: prefix
+        test_env_vars = {
+            "$ENV:TEST_VAR": "test_value",
+            "$ENV:ANOTHER_VAR": "another_value",
+        }
+        # Mock os.environ
+        monkeypatch.setattr("os.environ", test_env_vars)
+
+        # Mock feature flag to be disabled (empty list)
+        monkeypatch.setattr(constants, "FEATURE_FLAG", [])
+
+        # Test parameter file content with environment variables
+        test_content = """
+        parameter:
+          value: $ENV:TEST_VAR
+          other: $ENV:ANOTHER_VAR
+          normal: NORMAL_VAR
+        """
+        result = replace_variables_in_parameter_file(test_content)
+
+        # Verify NO replacements occurred since feature is disabled
+        # Environment variables should remain as-is in the output
+        assert "$ENV:TEST_VAR" in result
+        assert "$ENV:ANOTHER_VAR" in result
+        assert "NORMAL_VAR" in result  # Normal var unchanged
+
+        # Make sure no replacements happened
+        assert "test_value" not in result
+        assert "another_value" not in result
+
+    def test_replace_env_variables_in_content(self, monkeypatch):
+        """Test replace_variables_in_parameter_file with feature flag enabled."""
+        # Set up test environment variables with $ENV: prefix
+        # This is required because the function filters os.environ for keys starting with $ENV:
+        test_env_vars = {
+            "$ENV:TEST_VAR": "test_value",
+            "$ENV:ANOTHER_VAR": "another_value",
+            "NORMAL_VAR": "normal_value",  # Should be ignored (no $ENV: prefix)
+        }
+        # Mock os.environ
+        monkeypatch.setattr("os.environ", test_env_vars)
+
+        # Mock feature flag to be enabled
+        monkeypatch.setattr(constants, "FEATURE_FLAG", ["enable_environment_variable_replacement"])
+
+        # Test parameter file content with environment variables
+        test_content = """
+        parameter:
+          value: $ENV:TEST_VAR
+          other: $ENV:ANOTHER_VAR
+          normal: NORMAL_VAR
+        """
+        result = replace_variables_in_parameter_file(test_content)
+        # Verify replacements
+        assert "value: test_value" in result
+        assert "other: another_value" in result
+        assert "normal: NORMAL_VAR" in result  # Normal var unchanged
+
+    def test_process_environment_key(self, mock_workspace):
+        """Test process_environment_key function with ALL environment key replacement."""
+        # Test with ALL key only - should replace with target environment
+        replace_value_dict_1 = {"_ALL_": "universal-value"}
+        replace_value_dict_2 = {"_all_": "universal-value"}
+        replace_value_dict_3 = {"_All_": "universal-value"}
+        replace_value_dict_4 = {"ALL": "universal-value"}
+
+        # Mock the workspace environment
+        mock_workspace.environment = "TEST"
+
+        # Call the function
+        result_1 = process_environment_key(mock_workspace.environment, replace_value_dict_1)
+        result_2 = process_environment_key(mock_workspace.environment, replace_value_dict_2)
+        result_3 = process_environment_key(mock_workspace.environment, replace_value_dict_3)
+        result_4 = process_environment_key(mock_workspace.environment, replace_value_dict_4)
+
+        # Verify _ALL_ key is replaced with the target environment
+        assert "_ALL_" not in result_1
+        assert "TEST" in result_1
+        assert result_1["TEST"] == "universal-value"
+
+        # Verify _all_ key is replaced with the target environment
+        assert "_all_" not in result_2
+        assert "TEST" in result_2
+        assert result_2["TEST"] == "universal-value"
+
+        # Verify _All_ key is replaced with the target environment
+        assert "_All_" not in result_3
+        assert "TEST" in result_3
+        assert result_3["TEST"] == "universal-value"
+
+        # Verify ALL key is replaced with the target environment
+        assert "ALL" in result_4
+        assert "TEST" not in result_4
+        assert result_4["ALL"] == "universal-value"
+
+        assert result_1 == {"TEST": "universal-value"}
+        assert result_1 == result_2 == result_3 != result_4
+
+        # Test without ALL key - should return unchanged dictionary
+        replace_value_dict_5 = {
+            "DEV": "dev-value",
+            "PROD": "prod-value",
+        }
+
+        # Mock the workspace environment
+        mock_workspace.environment = "TEST"
+
+        # Call the function
+        result = process_environment_key(mock_workspace.environment, replace_value_dict_5)
+
+        # Dictionary should remain unchanged
+        assert result == replace_value_dict_5
+        assert "TEST" not in result
+
+    def test_validate_item_type_in_scope_with_none(self):
+        """Tests validate_item_type_in_scope function when None is passed."""
+        from fabric_cicd._common._validate_input import validate_item_type_in_scope
+
+        # Test with None - should return all accepted item types
+        result = validate_item_type_in_scope(None)
+        assert result == list(constants.ACCEPTED_ITEM_TYPES)
+        assert len(result) > 0  # Ensure we got some types back
+        # Verify a few expected types are in the result
+        assert "Notebook" in result
+        assert "DataPipeline" in result
+        assert "Environment" in result
+
+    def test_validate_item_type_in_scope_with_valid_list(self):
+        """Tests validate_item_type_in_scope function with a valid list."""
+        from fabric_cicd._common._validate_input import validate_item_type_in_scope
+
+        # Test with valid list
+        valid_types = ["Notebook", "Lakehouse", "Environment"]
+        result = validate_item_type_in_scope(valid_types)
+        assert result == valid_types
+
+    def test_validate_item_type_in_scope_with_invalid_type(self):
+        """Tests validate_item_type_in_scope function with invalid item type."""
+        from fabric_cicd._common._validate_input import validate_item_type_in_scope
+
+        # Test with invalid item type
+        invalid_types = ["Notebook", "InvalidType", "Environment"]
+        with pytest.raises(InputError, match="Invalid or unsupported item type: 'InvalidType'"):
+            validate_item_type_in_scope(invalid_types)
+
+
+class TestPathUtilities:
+    """Tests for path utility functions in _utils.py."""
+
+    def test_process_input_path_none(self, temp_repository):
+        """Tests process_input_path with none input."""
+        result = process_input_path(temp_repository, None)
+        assert result is None
+
+    def test_process_input_path_string(self, temp_repository, monkeypatch):
+        """Tests process_input_path with string input."""
+
+        # Mock the helper functions and glob.has_magic
+        def mock_process_regular_path(path, repo, valid_paths, _):
+            if path == "file1.txt":
+                valid_paths.add(repo / "file1.txt")
+
+        def mock_process_wildcard_path(path, repo, valid_paths, _):
+            if path == "*.txt":
+                valid_paths.add(repo / "file1.txt")
+                valid_paths.add(repo / "file2.txt")
+
+        def mock_has_magic(path):
+            return "*" in path
+
+        # Apply the mocks
+        monkeypatch.setattr("fabric_cicd._parameter._utils._process_regular_path", mock_process_regular_path)
+        monkeypatch.setattr("fabric_cicd._parameter._utils._process_wildcard_path", mock_process_wildcard_path)
+        monkeypatch.setattr("glob.has_magic", mock_has_magic)
+
+        # Test with string path
+        result = process_input_path(temp_repository, "file1.txt")
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0].name == "file1.txt"
+
+        # Test with wildcard string
+        result = process_input_path(temp_repository, "*.txt")
+        assert isinstance(result, list)
+        assert len(result) == 2  # Should find the 2 .txt files in root
+
+    def test_process_input_path_list(self, temp_repository, monkeypatch):
+        """Tests process_input_path with list input."""
+        # Create a mapping of paths to the files they should find
+        path_results = {
+            "file1.txt": [temp_repository / "file1.txt"],
+            "*.json": [temp_repository / "file2.json"],
+            "folder1/*.py": [temp_repository / "folder1" / "file3.py"],
+        }
+
+        # Mock the helper functions and glob.has_magic
+        def mock_process_regular_path(path, _, valid_paths, __):
+            if path in path_results and "*" not in path:
+                valid_paths.update(path_results[path])
+
+        def mock_process_wildcard_path(path, _, valid_paths, __):
+            if path in path_results and "*" in path:
+                valid_paths.update(path_results[path])
+
+        def mock_has_magic(path):
+            return "*" in path
+
+        # Apply the mocks
+        monkeypatch.setattr("fabric_cicd._parameter._utils._process_regular_path", mock_process_regular_path)
+        monkeypatch.setattr("fabric_cicd._parameter._utils._process_wildcard_path", mock_process_wildcard_path)
+        monkeypatch.setattr("glob.has_magic", mock_has_magic)
+
+        # Test with list of paths including both regular and wildcard patterns
+        paths = ["file1.txt", "*.json", "folder1/*.py"]
+        result = process_input_path(temp_repository, paths)
+        assert isinstance(result, list)
+        assert len(result) == 3  # Should find file1.txt, file2.json, and folder1/file3.py
+        assert any(p.name == "file1.txt" for p in result)
+        assert any(p.name == "file2.json" for p in result)
+        assert any(p.name == "file3.py" for p in result)
+
+    def test_process_input_path_has_magic_exception(self, temp_repository, monkeypatch):
+        """Tests process_input_path when glob.has_magic raises an exception."""
+        # Create a mock logger to verify logging
+        mock_logger = mock.MagicMock()
+        monkeypatch.setattr("fabric_cicd._parameter._utils.logger", mock_logger)
+
+        # Mock glob.has_magic to raise an exception
+        def mock_has_magic(_):
+            msg = "Mock exception in has_magic"
+            raise ValueError(msg)
+
+        monkeypatch.setattr("glob.has_magic", mock_has_magic)
+
+        # Test with a single path - should handle the exception gracefully
+        result = process_input_path(temp_repository, "file1.txt", False)
+
+        # Verify the result is a list and it's empty (since we couldn't process the path)
+        assert isinstance(result, list)
+        assert len(result) == 0
+
+        # Verify that the error was logged
+        assert mock_logger.debug.called
+        assert "Error checking for wildcard" in mock_logger.debug.call_args_list[0][0][0]
+        mock_logger.reset_mock()
+
+        # Test with a list of paths - should attempt to process each path but return empty list
+        # since all paths will fail the glob.has_magic check with an exception
+        result = process_input_path(temp_repository, ["file1.txt", "file2.txt"], False)
+        assert isinstance(result, list)
+        assert len(result) == 0
+
+        # Verify that errors were logged for both paths
+        assert mock_logger.debug.call_count == 2
+        assert "Error checking for wildcard" in mock_logger.debug.call_args_list[0][0][0]
+        assert "Error checking for wildcard" in mock_logger.debug.call_args_list[1][0][0]
+
+    def test_resolve_input_path_with_invalid_wildcard_syntax(self, temp_repository, monkeypatch):
+        """Tests _resolve_input_path when _validate_wildcard_syntax returns False."""
+        # Create a valid path in the temp repository
+        valid_path = temp_repository / "test.txt"
+        valid_path.write_text("test content")
+
+        # Mock _validate_wildcard_syntax to return False for our test pattern
+        def mock_validate_wildcard_syntax(pattern, _):
+            return pattern != "invalid*.txt"  # Return False only for our test pattern
+
+        monkeypatch.setattr("fabric_cicd._parameter._utils._validate_wildcard_syntax", mock_validate_wildcard_syntax)
+
+        # Use a public function that calls _resolve_input_path with wildcard=True
+        result = process_input_path(temp_repository, "invalid*.txt")
+
+        # Should be empty because the wildcard validation failed
+        assert len(result) == 0
+
+    def test_process_input_path_some_invalid(self, temp_repository, monkeypatch):
+        """Tests process_input_path with some invalid paths."""
+        # Create a mock logger
+        mock_logger = mock.MagicMock()
+        monkeypatch.setattr("fabric_cicd._parameter._utils.logger", mock_logger)
+
+        # Create test files we need for this test
+        (temp_repository / "valid_file.txt").write_text("valid content")
+
+        # Mock glob.has_magic to succeed for specific paths and fail for others
+        import glob as glob_module
+
+        original_has_magic = glob_module.has_magic
+
+        def mock_has_magic(path):
+            if path == "error_path.txt":
+                msg = "Mock error for specific path"
+                raise ValueError(msg)
+            return original_has_magic(path)
+
+        monkeypatch.setattr("glob.has_magic", mock_has_magic)
+
+        # Mock _resolve_file_path to return a valid path for specific files
+        def mock_resolve_file_path(path, *_):
+            if "valid_file.txt" in str(path):
+                return path
+            return None
+
+        monkeypatch.setattr("fabric_cicd._parameter._utils._resolve_file_path", mock_resolve_file_path)
+
+        # Test with a mix of valid and problematic paths
+        result = process_input_path(temp_repository, ["valid_file.txt", "error_path.txt", "nonexistent_file.txt"])
+
+        # Should return only valid paths
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert "valid_file.txt" in str(result[0])
+
+        # Verify errors were logged for problematic paths
+        assert mock_logger.debug.called
+        assert any("Error checking for wildcard" in call[0][0] for call in mock_logger.debug.call_args_list)
+
+    def test_process_wildcard_path(self, temp_repository, monkeypatch):
+        """Tests _process_wildcard_path function."""
+        # Create the test files we need for this test
+        (temp_repository / "file1.txt").write_text("content1")
+        (temp_repository / "file2.txt").write_text("content2")
+        (temp_repository / "folder2" / "file5.txt").write_text("content5")
+
+        # We need to patch the actual Path.glob method with our own implementation
+        original_glob = Path.glob
+
+        def patched_glob(self, pattern):
+            # Special case for our test - return predefined results
+            if str(self) == str(temp_repository):
+                if pattern == "*.txt":
+                    return [temp_repository / "file1.txt", temp_repository / "file2.txt"]
+                if pattern == "**/*.txt":
+                    return [
+                        temp_repository / "file1.txt",
+                        temp_repository / "file2.txt",
+                        temp_repository / "folder2" / "file5.txt",
+                    ]
+            # Fall back to original method for other cases
+            return original_glob(self, pattern)
+
+        # Apply the patch
+        monkeypatch.setattr(Path, "glob", patched_glob)
+
+        # Set up a valid paths set
+        valid_paths = set()
+        mock_log = mock.MagicMock()
+
+        # Mock _set_wildcard_path_pattern to return our test pattern
+        def mock_set_pattern(pattern, _repo, _log):
+            return "*.txt" if pattern == "*.txt" else "**/*.txt"
+
+        monkeypatch.setattr("fabric_cicd._parameter._utils._set_wildcard_path_pattern", mock_set_pattern)
+
+        # Mock _resolve_file_path to return valid paths
+        def mock_resolve_path(path, _repo, _path_type, _log):
+            return path
+
+        monkeypatch.setattr("fabric_cicd._parameter._utils._resolve_file_path", mock_resolve_path)
+
+        # Test with wildcard pattern for txt files
+        _process_wildcard_path("*.txt", temp_repository, valid_paths, mock_log)
+        assert len(valid_paths) == 2  # Should find file1.txt and file2.txt in root
+        assert all(path.suffix == ".txt" for path in valid_paths)
+
+        # Reset paths and test with recursive pattern
+        valid_paths.clear()
+        _process_wildcard_path("**/*.txt", temp_repository, valid_paths, mock_log)
+        assert len(valid_paths) == 3  # Should find all .txt files (including in subdirectories)
+
+    def test_process_regular_path(self, temp_repository, monkeypatch):
+        """Tests _process_regular_path with regular file paths."""
+
+        # Set up a valid paths set
+        valid_paths = set()
+        mock_log = mock.MagicMock()
+
+        # Mock _resolve_file_path to return valid paths for specific files
+        def mock_resolve_file_path(path, _repo, _path_type, _log):
+            if path.name == "file1.txt" or path.name == "file2.json":
+                return path.resolve()
+            return None
+
+        monkeypatch.setattr("fabric_cicd._parameter._utils._resolve_file_path", mock_resolve_file_path)
+
+        # Test with specific file path
+        _process_regular_path("file1.txt", temp_repository, valid_paths, mock_log)
+        assert len(valid_paths) == 1
+        assert next(iter(valid_paths)).name == "file1.txt"
+
+        # Reset and test with absolute path
+        valid_paths.clear()
+        abs_path = str(temp_repository / "file2.json")
+        _process_regular_path(abs_path, temp_repository, valid_paths, mock_log)
+        assert len(valid_paths) == 1
+        assert next(iter(valid_paths)).name == "file2.json"
+
+        # Test with nonexistent file
+        valid_paths.clear()
+        _process_regular_path("nonexistent.txt", temp_repository, valid_paths, mock_log)
+        assert len(valid_paths) == 0  # Should not add nonexistent files
+
+    def test_resolve_nonexistent_file_path(self, temp_repository):
+        """Tests _resolve_file_path with nonexistent files."""
+        # Test nonexistent file
+        file_path = temp_repository / "nonexistent.txt"
+        result = _resolve_file_path(file_path, temp_repository, "Relative", logger.debug)
+        assert result is None
+
+    def test_resolve_directory_file_path(self, temp_repository):
+        """Tests _resolve_file_path with directories."""
+        # Test with directory instead of file
+        dir_path = temp_repository / "folder1"
+        result = _resolve_file_path(dir_path, temp_repository, "Relative", logger.debug)
+        assert result is None
+
+    def test_resolve_input_path_absolute_path(self):
+        """Test _resolve_input_path with absolute path."""
+        # Using a standard logger function format that takes a string message
+        mock_logger = MagicMock()
+        repo_dir = Path("c:/test_repo").resolve()  # Make sure it's resolved
+
+        # Test with absolute path outside repository
+        outside_path = Path("c:/outside/file.txt").resolve()  # Make sure it's resolved
+
+        # Simulate a path outside the repo by mocking the relative_to method
+        with mock.patch.object(Path, "relative_to", side_effect=ValueError("Path outside repo")):
+            result = _resolve_file_path(outside_path, repo_dir, "Absolute", mock_logger)
+            # Check that the function returns None (path rejected)
+            assert result is None
+            # Check that the logger was called with an error about the path being outside
+            mock_logger.assert_called_once_with(f"Absolute path '{outside_path}' is outside the repository directory")
+
+    def test_resolve_outside_repo_file_path(self, temp_repository):
+        """Tests _resolve_file_path with paths outside the repository."""
+        # Create a file outside the repository
+        outside_dir = Path(tempfile.mkdtemp())
+        try:
+            outside_file = outside_dir / "outside.txt"
+            outside_file.write_text("outside content")
+
+            # Test with file outside repository
+            result = _resolve_file_path(outside_file, temp_repository, "Absolute", logger.debug)
+            assert result is None
+        finally:
+            shutil.rmtree(outside_dir)
+
+    def test_resolve_invalid_file_path(self, temp_repository, monkeypatch):
+        """Tests _resolve_file_path with a path that causes exception."""
+
+        # Set up a mock that raises an exception when checking if file exists
+        def mock_path_exists(_):
+            msg = "Permission denied"
+            raise PermissionError(msg)
+
+        # Apply the mock
+        monkeypatch.setattr(Path, "exists", mock_path_exists)
+
+        # Test the exception handling
+        file_path = temp_repository / "file1.txt"
+        result = _resolve_file_path(file_path, temp_repository, "Test", logger.debug)
+        assert result is None
+
+    def test_validate_wildcard_syntax_invalid(self):
+        """Test _validate_wildcard_syntax with invalid wildcard syntax."""
+        # Create a mock function to pass as log_func
+        mock_log_func = MagicMock()
+
+        # Test with invalid recursive wildcard format - double asterisk without proper format
+        # This will trigger the check: "**" in p and not ("**/" in p or "/**" in p)
+        invalid_path = "src**invalid.py"  # Missing slash between src and **
+
+        # Call the function being tested
+        result = _validate_wildcard_syntax(invalid_path, mock_log_func)
+
+        # Verify validation fails
+        assert result is False
+
+        # Check that log_func was called exactly once with the expected message
+        mock_log_func.assert_called_once_with(f"Invalid recursive wildcard format (use **/ or /**): '{invalid_path}'")
+
+    def test_valid_wildcard_syntax(self):
+        """Tests that valid wildcard patterns pass validation."""
+        # Create a mock logger
+        mock_log_func = mock.MagicMock()
+
+        valid_patterns = [
+            "*.txt",
+            "**/*.py",
+            "folder1/*.json",
+            "folder?/*.txt",
+            "folder[1-3]/*.txt",
+            "file[!1-3].txt",
+            "file{1,2,3}.txt",
+            "**/subfolder/*.md",
+        ]
+
+        for pattern in valid_patterns:
+            assert _validate_wildcard_syntax(pattern, mock_log_func) is True, f"Pattern should be valid: {pattern}"
+            mock_log_func.assert_not_called()  # No errors should be logged
+
+    def test_invalid_wildcard_syntax(self):
+        """Tests that invalid wildcard patterns fail validation, including complex bracket/brace nesting issues."""
+        # Create a mock logger
+        mock_log_func = mock.MagicMock()
+
+        # Group 1: Basic validation errors
+        basic_invalid_patterns = [
+            "",  # Empty string
+            "   ",  # Whitespace only
+            "../file.txt",  # Path traversal
+            "folder/../file.txt",  # Path traversal
+            "..%2Ffile.txt",  # Encoded path traversal
+        ]
+
+        # Group 2: Wildcard pattern errors
+        wildcard_invalid_patterns = [
+            "/**/*/",  # Invalid combination
+            "**/**",  # Invalid combination
+            "folder//file.txt",  # Double slashes
+            "folder\\\\file.txt",  # Double backslashes
+            "**file.txt",  # Incorrect recursive format
+            "//**/test.txt",  # Absolute path with recursive pattern
+        ]
+
+        # Group 3: Bracket/brace validation errors
+        bracket_brace_invalid_patterns = [
+            "folder[].txt",  # Empty brackets
+            "folder[abc.txt",  # Unclosed bracket
+            "folder{}.txt",  # Empty braces
+            "folder{abc.txt",  # Unclosed brace
+            "folder{,}.txt",  # Invalid comma in braces
+            "folder{a,,b}.txt",  # Empty option in braces
+            "folder{abc}.txt",  # Brace without comma
+            "folder[a-",  # Unclosed bracket with range
+        ]
+
+        # Test all invalid patterns
+        all_invalid_patterns = basic_invalid_patterns + wildcard_invalid_patterns + bracket_brace_invalid_patterns
+        for pattern in all_invalid_patterns:
+            assert _validate_wildcard_syntax(pattern, mock_log_func) is False, f"Pattern should be invalid: {pattern}"
+            mock_log_func.assert_called()  # Error should be logged
+            mock_log_func.reset_mock()
+
+        complex_invalid_nested_patterns = [
+            "folder[[a[b]c].txt",  # Unbalanced nested brackets
+            "folder{a{b,c}.txt",  # Unbalanced nested braces
+        ]
+
+        # Test more complex bracket/brace nesting scenarios
+        for pattern in complex_invalid_nested_patterns:
+            assert _validate_wildcard_syntax(pattern, mock_log_func) is False, f"Pattern should be invalid: {pattern}"
+            mock_log_func.assert_called()  # Error should be logged
+            mock_log_func.reset_mock()
+
+    def test_validate_nested_brackets_braces(self):
+        """Tests the _validate_nested_brackets_braces function to ensure proper validation of bracket/brace nesting."""
+        from fabric_cicd._parameter._utils import _validate_nested_brackets_braces as validate_func
+
+        mock_log_func = mock.MagicMock()
+
+        valid_nested_patterns = [
+            "file[abc].txt",  # Simple bracket
+            "file{a,b,c}.txt",  # Simple brace
+            "file[abc]{1,2,3}.txt",  # Both brackets and braces
+            "file[a[b]c].txt",  # Nested brackets (valid in some glob implementations)
+            "file{a{b,c},d}.txt",  # Nested braces
+            "file[[]].txt",  # Escaped bracket in character class
+            "file[a-z].{txt,md}",  # Multiple bracket/brace pairs
+        ]
+
+        # Test valid patterns
+        for pattern in valid_nested_patterns:
+            assert validate_func(pattern, mock_log_func) is True, f"Pattern should be valid: {pattern}"
+            mock_log_func.assert_not_called()
+            mock_log_func.reset_mock()
+
+        invalid_nested_patterns = [
+            "file[abc.txt",  # Unclosed bracket
+            "file{a,b.txt",  # Unclosed brace
+            "file]abc[.txt",  # Closing before opening
+            "file}abc{.txt",  # Closing before opening
+            "file[abc}.txt",  # Mismatched pairs
+            "file{abc].txt",  # Mismatched pairs
+            "file[a{b]c}.txt",  # Interleaved mismatched pairs
+            "file{a[b}c].txt",  # Interleaved mismatched pairs
+        ]
+
+        # Test invalid patterns
+        for pattern in invalid_nested_patterns:
+            assert validate_func(pattern, mock_log_func) is False, f"Pattern should be invalid: {pattern}"
+            mock_log_func.assert_called_once()
+            mock_log_func.reset_mock()

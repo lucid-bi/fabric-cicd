@@ -4,18 +4,29 @@ authors = [{ name = "Microsoft Corporation" }]
 description = "Microsoft Fabric CI/CD"
 readme = "README.md"
 requires-python = ">=3.9,<3.13"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 dynamic = ["version"]
-urls.Repository = "https://github.com/microsoft/fabric-cicd.git"
-
+classifiers = [
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
     "azure-identity>=1.19.0",
     "dpath>=2.2.0",
     "filetype>=1.2.0",
+    "jsonpath-ng>=1.7.0",
     "packaging>=24.2",
     "pyyaml>=6.0.2",
     "requests>=2.32.3",
 ]
+
+[project.urls]
+Repository = "https://github.com/microsoft/fabric-cicd.git"
+Changelog = "https://github.com/microsoft/fabric-cicd/blob/main/docs/changelog.md"
 
 [dependency-groups]
 dev = [
@@ -38,7 +49,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 dynamic.version = { attr = "fabric_cicd.constants.VERSION" }
 packages.find.where = ["src"]
-package-data = { "fabric_cicd" = ["changelog.md"] }
 
 [tool.uv]
 package = true

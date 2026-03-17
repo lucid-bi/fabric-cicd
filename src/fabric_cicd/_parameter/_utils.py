@@ -7,16 +7,426 @@ and for debugging the parameter file. The utilities include validating the param
 parameter dictionary structure, processing parameter values, and handling parameter value replacements.
 """
 
+import glob
+import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional, Union
 
-from azure.core.credentials import TokenCredential
+import yaml
+from jsonpath_ng.ext import parse
 
 import fabric_cicd.constants as constants
+from fabric_cicd import FabricWorkspace
+from fabric_cicd._common._exceptions import InputError, ParsingError
+from fabric_cicd.constants import ItemType
 
 logger = logging.getLogger(__name__)
+
+"""Functions to extract parameter values"""
+
+
+def _validate_regex_structure(pattern: re.Pattern, find_value: str) -> None:
+    """
+    Validates regex pattern structure to ensure it has exactly one capturing group.
+    This validation is performed independently of whether the pattern matches any content.
+
+    Args:
+        pattern: Compiled regex pattern
+        find_value: The regex pattern string for error messages
+
+    Raises:
+        InputError: If the regex doesn't have exactly one capturing group
+    """
+    # Check the number of capturing groups in the pattern
+    if pattern.groups != 1:
+        msg = f"Regex pattern '{find_value}' must contain exactly one capturing group."
+        raise InputError(msg, logger)
+
+
+def _validate_regex_pattern(matches: list, find_value: str) -> None:
+    """
+    Validates regex pattern matches to ensure the captured value is not empty.
+
+    Args:
+        matches: List of regex match objects
+        find_value: The regex pattern string for error messages
+
+    Raises:
+        InputError: If validation fails
+    """
+    if matches:
+        # Check if the captured group is empty (which would be invalid)
+        captured_value = matches[0].group(1)
+        if not captured_value:
+            msg = f"Regex pattern '{find_value}' captured an empty value."
+            raise InputError(msg, logger)
+
+
+def extract_find_value(param_dict: dict, file_content: str, filter_match: bool) -> dict:
+    """
+    Extracts the find_value and sets the value. Processes the find_value if a valid regex is provided.
+    Returns replacement information for use with re.sub() or string replace().
+
+    Args:
+        param_dict: The parameter dictionary containing the find_value and is_regex keys.
+        file_content: The content of the file where the find_value will be searched.
+        filter_match: A boolean to check for a regex match in filtered files only.
+
+    Returns:
+        Dictionary with keys:
+        - 'pattern': The find pattern (original string or regex pattern)
+        - 'is_regex': Whether this is a regex pattern
+        - 'has_matches': Whether any matches were found
+    """
+    find_value = param_dict.get("find_value")
+    is_regex = param_dict.get("is_regex", "").lower() == "true"
+
+    # No find value -> nothing to do
+    if not find_value:
+        return {"pattern": "", "is_regex": False, "has_matches": False}
+
+    # Regex find_value
+    if is_regex:
+        try:
+            compiled = re.compile(find_value)
+        except re.error as re_err:
+            msg = f"Invalid regex '{find_value}': {re_err}"
+            raise InputError(msg, logger) from re_err
+
+        # Validate structure (to catch bad patterns early)
+        _validate_regex_structure(compiled, find_value)
+
+        # If file excluded by filters, do not search — return no-match but keep validation
+        if not filter_match:
+            return {"pattern": find_value, "is_regex": True, "has_matches": False}
+
+        matches = list(re.finditer(compiled, file_content))
+        _validate_regex_pattern(matches, find_value)
+
+        return {"pattern": find_value, "is_regex": True, "has_matches": bool(matches)}
+
+    # Non-regex find_value
+    if not filter_match:
+        return {"pattern": find_value, "is_regex": False, "has_matches": False}
+
+    return {"pattern": find_value, "is_regex": False, "has_matches": find_value in file_content}
+
+
+def extract_replace_value(workspace_obj: FabricWorkspace, replace_value: str, get_dataflow_name: bool = False) -> str:
+    """Extracts the replace_value and sets the value. Processes the replace_value if a valid variable is provided."""
+    if not replace_value.startswith("$"):
+        if get_dataflow_name:
+            logger.debug(
+                "Can't get dataflow name as the replace_value was set to a regular string, not the items variable"
+            )
+            return None
+        return replace_value
+
+    # If $workspace variable, return the workspace ID value
+    if replace_value.startswith("$workspace."):
+        if get_dataflow_name:
+            msg = "Invalid replace_value variable: '$workspace'. Expected format to get dataflow name: $items.type.name.attribute"
+            raise InputError(msg, logger)
+
+        return _extract_workspace_id(workspace_obj, replace_value)
+
+    # If $items variable, return the item attribute value if found
+    if replace_value.startswith("$items."):
+        return _extract_item_attribute(workspace_obj, replace_value, get_dataflow_name)
+
+    # Otherwise, raise an error for invalid variable syntax
+    msg = f"Invalid replace_value variable format: '{replace_value}'. Expected format: $items.type.name.attribute or $workspace.id"
+    raise InputError(msg, logger)
+
+
+def _extract_workspace_id(workspace_obj: FabricWorkspace, replace_value: str) -> str:
+    """
+    Extracts the workspace ID from the $workspace variable to set as the replace_value.
+
+    Supports the following formats:
+    - $workspace.id or $workspace.$id - Returns the target workspace ID
+    - $workspace.<name> - Resolves the workspace ID from the name
+    - $workspace.<name>.$items.<type>.<name>.$<attribute> - Resolves an item attribute from the specified workspace,
+      where $attribute is any supported attribute in constants.ITEM_ATTR_LOOKUP
+    """
+    # Case 1: $workspace.id
+    if replace_value == "$workspace.id" or replace_value == "$workspace.$id":
+        return workspace_obj.workspace_id
+
+    try:
+        # Extract the variable string without the prefix
+        var_string = replace_value.removeprefix("$workspace.")
+
+        # Check if this is a cross-workspace item reference
+        if "$items." in var_string:
+            # Check if the variable ends with a valid attribute
+            valid_attribute = False
+            attribute = None
+
+            for attr in constants.ITEM_ATTR_LOOKUP:
+                if var_string.endswith(f".${attr}"):
+                    valid_attribute = True
+                    attribute = attr
+                    break
+
+            if not valid_attribute:
+                msg = f"Invalid syntax or missing attribute in cross-workspace variable '{replace_value}'. Expected format: $workspace.name.$items.type.name.$attribute where attribute is one of: {', '.join(constants.ITEM_ATTR_LOOKUP)}"
+                raise ParsingError(msg, logger)
+
+            # Split on the $items prefix to get workspace name
+            workspace_part, items_part = var_string.split(".$items.", 1)
+            workspace_name = workspace_part.strip()
+            logger.debug(f"Extracted workspace name: {workspace_name}")
+
+            # Get workspace ID
+            workspace_id = workspace_obj._resolve_workspace_id(workspace_name)
+
+            # Remove the trailing .$attribute to get the item info
+            items_info = items_part.removesuffix(f".${attribute}")
+
+            # Find the last period to separate item type from item name
+            last_period_pos = items_info.rfind(".")
+            if last_period_pos == -1:
+                msg = f"Invalid $workspace variable syntax: {replace_value}. Expected format: $workspace.name.$items.type.name.$attribute"
+                raise ParsingError(msg, logger)
+
+            # Extract item_type and item_name
+            item_type = items_info[:last_period_pos].strip()
+            item_name = items_info[last_period_pos + 1 :].strip()
+
+            logger.debug(f"Extracted item type: {item_type}, item name: {item_name}, attribute: {attribute}")
+
+            if item_type not in constants.ACCEPTED_ITEM_TYPES:
+                msg = f"Item type '{item_type}' is invalid or not supported"
+                raise ParsingError(msg, logger)
+
+            # Look up the attribute value of the item in the specified workspace
+            attribute_value = workspace_obj._lookup_item_attribute(workspace_id, item_type, item_name, attribute)
+            logger.debug(f"Found item {attribute}: {attribute_value}")
+            return attribute_value
+
+        # Pattern: $workspace.<name>
+        workspace_name = var_string.strip()
+        logger.debug(f"Extracted workspace name: {workspace_name}")
+
+        # Resolve workspace ID
+        return workspace_obj._resolve_workspace_id(workspace_name)
+
+    except Exception as e:
+        # Re-raise exceptions
+        if isinstance(e, (ParsingError, InputError)):
+            raise e
+
+        # Otherwise, wrap it in a ParsingError
+        msg = f"Error parsing $workspace variable: {e}"
+        raise ParsingError(msg, logger) from e
+
+
+def _extract_item_attribute(workspace_obj: FabricWorkspace, variable: str, get_dataflow_name: bool) -> str:
+    """
+    Extracts the item attribute value from the $items variable to set as the replace_value.
+
+    Args:
+        workspace_obj: The FabricWorkspace object containing the workspace items dictionary used to access item metadata.
+        variable: The $items variable string to be parsed and processed.
+            Supports the following formats:
+            - $items.type.name.attribute (legacy format)
+            - $items.type.name.$attribute (new format)
+            Supported attributes: id, sqlendpoint, queryserviceuri
+        get_dataflow_name: A boolean flag to indicate if the dataflow item name should be returned instead of the attribute value.
+    """
+    error = None
+    try:
+        var_string = variable.removeprefix("$items.")
+
+        # Check for new pattern with $attribute
+        if ".$" in var_string:
+            # Split on the $attribute marker
+            name_part, attr_part = var_string.rsplit(".$", 1)
+
+            # Extract attribute name
+            attribute = attr_part.strip()
+
+            # Find the last period to separate item_type from item_name
+            last_period_pos = name_part.rfind(".")
+            if last_period_pos == -1:
+                msg = f"Invalid $items variable syntax: {variable}. Expected format: $items.type.name.$attribute"
+                error = ParsingError(msg, logger)
+                return None
+
+            # Extract item_type and item_name
+            item_type = name_part[:last_period_pos].strip()
+            item_name = name_part[last_period_pos + 1 :].strip()
+
+        # Backward compatibility for legacy pattern
+        else:
+            msg = f"Invalid $items variable syntax: {variable}. Expected format: $items.type.name.attribute"
+            # Split the string to get item_type (first part)
+            parts = var_string.split(".", 1)
+            if len(parts) < 2:
+                error = ParsingError(msg, logger)
+                return None
+
+            item_type = parts[0].strip()
+
+            # Get the attribute (last part)
+            if "." not in parts[1]:
+                error = ParsingError(msg, logger)
+                return None
+
+            # Find the position of the last period which separates item_name from attribute
+            last_period_pos = parts[1].rfind(".")
+            if last_period_pos == -1:
+                error = ParsingError(msg, logger)
+                return None
+
+            # Extract item_name and attribute
+            item_name = parts[1][:last_period_pos].strip()
+            attribute = parts[1][last_period_pos + 1 :].strip()
+
+            logger.warning(
+                "The $items variable format has changed. Please update to the new format: $items.type.name.$attribute"
+            )
+
+        # Validate attribute before further processing
+        attr_name = attribute.lower()
+        if attr_name not in constants.ITEM_ATTR_LOOKUP:
+            msg = f"Attribute '{attribute}' is invalid. Supported attributes: {list(constants.ITEM_ATTR_LOOKUP)}"
+            error = ParsingError(msg, logger)
+            return None
+
+        logger.debug(
+            f"Processing $items variable with item_type={item_type}, item_name={item_name}, attribute={attribute}"
+        )
+
+        # Refresh the workspace items to get the latest deployed items
+        workspace_obj._refresh_deployed_items()
+
+        # Validate item type exists in the deployed workspace
+        if item_type not in workspace_obj.workspace_items and not get_dataflow_name:
+            msg = f"Item type '{item_type}' is invalid or not found in deployed items"
+            error = ParsingError(msg, logger)
+            return None
+
+        # Check if the specific item is deployed
+        if item_name not in workspace_obj.workspace_items.get(item_type, {}) and not get_dataflow_name:
+            msg = f"Item '{item_name}' not found as a deployed {item_type}"
+            error = ParsingError(msg, logger)
+            return None
+
+        # Special case: set to True in the context of a Dataflow that references another Dataflow
+        if get_dataflow_name:
+            if (
+                item_type in workspace_obj.repository_items
+                and item_type == ItemType.DATAFLOW.value
+                and item_name in workspace_obj.repository_items[item_type]
+                and attribute == "id"
+            ):
+                logger.debug("Source Dataflow reference will be replaced separately")
+                return item_name
+            # Return None for non-existent item
+            return None
+
+        # Get the item's attributes from workspace items
+        item_attr_values = workspace_obj.workspace_items[item_type][item_name]
+
+        # Get the attribute value and check if it exists
+        attr_value = item_attr_values.get(attr_name)
+        if not attr_value:
+            msg = f"Value does not exist for attribute '{attribute}' in the {item_type} item '{item_name}'"
+            error = ParsingError(msg, logger)
+            return None
+
+        logger.debug(f"Found attribute '{attr_name}' with value '{attr_value}'")
+        return attr_value
+
+    except Exception as e:
+        # If it's not a ParsingError, create a new one
+        if not isinstance(e, ParsingError):
+            error = ParsingError(f"Error parsing $items variable: {e!s}", logger)
+        error = e
+        return None
+
+    finally:
+        # Raise error at the very end (only once)
+        if error is not None:
+            raise error
+
+
+def extract_parameter_filters(workspace_obj: FabricWorkspace, param_dict: dict) -> tuple[str, str, Path]:
+    """Extracts the item type, name, and path filters from the parameter dictionary, if present."""
+    item_type = param_dict.get("item_type")
+    item_name = param_dict.get("item_name")
+    file_path = process_input_path(workspace_obj.repository_directory, param_dict.get("file_path"))
+
+    return item_type, item_name, file_path
+
+
+def process_environment_key(environment: str, replace_value_dict: dict) -> dict:
+    """Processes the replace_value dictionary to replace the '_ALL_' environment key with the target environment when present."""
+    # If there's only one key, check if it's "_ALL_" (case insensitive) and replace it
+    # Note: When other env keys are present with _ALL_, upstream parameter validation fails
+    if len(replace_value_dict) == 1:
+        key = next(iter(replace_value_dict))
+        if key.lower() == "_all_":
+            replace_value_dict[environment] = replace_value_dict.pop(key)
+
+    return replace_value_dict
+
+
+"""Functions to replace key values in JSON or YAML"""
+
+
+def replace_key_value(
+    workspace_obj: FabricWorkspace, param_dict: dict, content: str, env: str, is_yaml: bool = False
+) -> str:
+    """A function to replace key values in a JSON or YAML using parameterization. It uses jsonpath_ng to find and replace values in the JSON.
+
+    Args:
+        workspace_obj: The FabricWorkspace object.
+        param_dict: The parameter dictionary.
+        content: the JSON/YAML content to be modified.
+        env: The environment variable to be used for replacement.
+        is_yaml: A boolean indicating if the content is YAML (default is False for JSON).
+    """
+    # Parse content to a dictionary based on format (YAML or JSON)
+    if is_yaml:
+        try:
+            data = yaml.safe_load(content)
+        except yaml.YAMLError as ye:
+            raise ValueError(ye) from ye
+
+        # Handle empty YAML files
+        if data is None:
+            return content
+    else:
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as jde:
+            raise ValueError(jde) from jde
+
+    # Extract the jsonpath expression from the find_key attribute of the param_dict
+    jsonpath_expr = parse(param_dict["find_key"])
+    replace_value_dict = process_environment_key(workspace_obj.environment, param_dict["replace_value"])
+    for match in jsonpath_expr.find(data):
+        # If the env is present in the replace_value array perform the replacement
+        if env in replace_value_dict:
+            try:
+                # Process the replace value to handle $items notation
+                processed_value = replace_value_dict[env]
+                if isinstance(processed_value, str):
+                    processed_value = extract_replace_value(workspace_obj, processed_value)
+                match.full_path.update(data, processed_value)
+                logger.debug(
+                    f"Value: {match.value} found at path: {match.full_path} to be replaced with value: {processed_value}"
+                )
+            except Exception as match_e:
+                raise ValueError(match_e) from match_e
+
+    return yaml.dump(data, default_flow_style=False, allow_unicode=True) if is_yaml else json.dumps(data)
 
 
 def replace_variables_in_parameter_file(raw_file: str) -> str:
@@ -42,12 +452,15 @@ def replace_variables_in_parameter_file(raw_file: str) -> str:
     return raw_file
 
 
+"""Functions to validate the parameter file"""
+
+
 def validate_parameter_file(
     repository_directory: str,
-    item_type_in_scope: list,
+    item_type_in_scope: Optional[list] = None,
     environment: str = "N/A",
     parameter_file_name: str = "parameter.yml",
-    token_credential: TokenCredential = None,
+    parameter_file_path: Optional[str] = None,
 ) -> bool:
     """
     A wrapper function that validates a parameter.yml file, using
@@ -55,45 +468,37 @@ def validate_parameter_file(
 
     Args:
         repository_directory: The directory containing the items and parameter.yml file.
-        item_type_in_scope: A list of item types to validate.
+        item_type_in_scope: A list of item types to validate. If omitted, defaults to all supported item types.
         environment: The target environment.
         parameter_file_name: The name of the parameter file, default is "parameter.yml".
-        token_credential: The token credential to use for authentication, use for SPN auth.
+        parameter_file_path: The path to the parameter file, if different from the default.
     """
-    from azure.identity import DefaultAzureCredential
-
-    from fabric_cicd._common._fabric_endpoint import FabricEndpoint
     from fabric_cicd._common._validate_input import (
         validate_environment,
         validate_item_type_in_scope,
         validate_repository_directory,
-        validate_token_credential,
     )
 
     # Import the Parameter class here to avoid circular imports
     from fabric_cicd._parameter._parameter import Parameter
 
-    endpoint = FabricEndpoint(
-        # if credential is not defined, use DefaultAzureCredential
-        token_credential=(
-            DefaultAzureCredential() if token_credential is None else validate_token_credential(token_credential)
-        )
-    )
     # Initialize the Parameter object with the validated inputs
     parameter_obj = Parameter(
         repository_directory=validate_repository_directory(repository_directory),
-        item_type_in_scope=validate_item_type_in_scope(item_type_in_scope, upn_auth=endpoint.upn_auth),
+        item_type_in_scope=validate_item_type_in_scope(item_type_in_scope),
         environment=validate_environment(environment),
         parameter_file_name=parameter_file_name,
+        parameter_file_path=parameter_file_path,
     )
     # Validate with _validate_parameter_file() method
     return parameter_obj._validate_parameter_file()
 
 
-def check_parameter_structure(param_dict: dict, param_name: Optional[str] = None) -> str:
+def is_valid_structure(param_dict: dict, param_name: Optional[str] = None) -> bool:
     """
     Checks the parameter dictionary structure and determines if it
-    contains the new structure (i.e. a list of values when indexed by the key).
+    contains the valid structure (i.e. a list of values when indexed by the key,
+    or the new dict format for semantic_model_binding).
 
     Args:
         param_dict: The parameter dictionary to check.
@@ -101,86 +506,320 @@ def check_parameter_structure(param_dict: dict, param_name: Optional[str] = None
     """
     # Check the structure of the specified parameter
     if param_name:
-        return _check_structure(param_dict.get(param_name))
+        # Special case for semantic_model_binding - can be list (legacy) or dict (new)
+        if param_name == "semantic_model_binding":
+            is_valid, _ = _check_semantic_model_binding_structure(param_dict.get(param_name))
+            return is_valid
+        return _check_parameter_structure(param_dict.get(param_name))
 
-    # Otherwise, check the structure of the entire parameter dictionary
-    find_replace_parameter = param_dict.get("find_replace")
-    spark_pool_parameter = param_dict.get("spark_pool")
+    # Get only parameters that exist in param_dict
+    existing_params = [name for name in constants.PARAM_NAMES if name in param_dict]
 
-    # If both parameters are present, check their structures
-    if find_replace_parameter and spark_pool_parameter:
-        find_replace_structure = _check_structure(find_replace_parameter)
-        spark_pool_structure = _check_structure(spark_pool_parameter)
-        # If both structures are the same, return the structure
-        if find_replace_structure == spark_pool_structure:
-            return find_replace_structure
-        return "invalid"
+    # If no parameters found, return False
+    if not existing_params:
+        return False
 
-    # If only one parameter is present, return its structure
-    if find_replace_parameter:
-        return _check_structure(find_replace_parameter)
-    if spark_pool_parameter:
-        return _check_structure(spark_pool_parameter)
-    return "invalid"
+    # Check all existing parameters have valid structure
+    for name in existing_params:
+        # Special case for semantic_model_binding
+        if name == "semantic_model_binding":
+            is_valid, _ = _check_semantic_model_binding_structure(param_dict.get(name))
+            if not is_valid:
+                return False
+        elif not _check_parameter_structure(param_dict.get(name)):
+            return False
+
+    return True
 
 
-def _check_structure(param_value: any) -> str:
+def _check_parameter_structure(param_value: any) -> bool:
     """Checks the structure of a parameter value"""
+    return isinstance(param_value, list)
+
+
+def _check_semantic_model_binding_structure(param_value: any) -> tuple[bool, bool]:
+    """
+    Checks the structure of semantic_model_binding parameter value.
+    Supports both legacy (list) and new (dict with 'default' or 'models') formats.
+    """
+    # Legacy format: list
     if isinstance(param_value, list):
-        return "new"
-    # TODO: Remove this condition after deprecation (April 24, 2025)
+        return (True, False)
+
+    # New format: dict with at least 'default' or 'models'
     if isinstance(param_value, dict):
-        return "old"
-    return "invalid"
+        has_default = "default" in param_value
+        has_models = "models" in param_value
+        is_valid = has_default or has_models
+        return (is_valid, True)
+
+    return (False, False)
+
+
+"""Functions to process and validate file paths from the optional filter"""
 
 
 def process_input_path(
-    repository_directory: Path, input_path: Union[str, list[str], None]
-) -> Union[Path, list[Path], None]:
+    repository_directory: Path, input_path: Union[str, list[str], None], validation_flag: bool = False
+) -> Union[list[Path], None]:
     """
-    Processes the input_path value according to its type.
+    Processes the input_path value according to its type. Supports both
+    regular paths and wildcard paths, including mixed lists.
 
     Args:
         repository_directory: The directory of the repository.
-        input_path: The input path value to process (None value, a string value, or list of string values).
+        input_path: The input path value to process (None, a string, or list of strings).
+        validation_flag: Flag to indicate the context of the function call to set the logging type.
     """
+    # Set the logging function based on validation_flag
+    log_func = logger.error if validation_flag else logger.debug
+
+    # Return None for None or empty input
     if not input_path:
-        return input_path
+        return None
 
-    if isinstance(input_path, list):
-        return [_convert_value_to_path(repository_directory, path) for path in input_path]
+    # Use a set to avoid duplicate paths
+    valid_paths = set()
 
-    return _convert_value_to_path(repository_directory, input_path)
+    # Standardize to list for consistent processing
+    paths_to_process = [input_path] if isinstance(input_path, str) else input_path
 
+    for path in paths_to_process:
+        # Process path based on whether it contains wildcard characters
+        has_wildcard = False
+        try:
+            has_wildcard = glob.has_magic(path)
+        except Exception as e:
+            log_func(f"Error checking for wildcard in path '{path}': {e}")
+            continue
 
-def _convert_value_to_path(repository_directory: Path, input_path: str) -> Path:
-    """
-    Converts the input_path string value to a Path object
-    and resolves a relative path as an absolute path, if present.
-    """
-    if not Path(input_path).is_absolute():
-        # Strip leading slashes or backslashes
-        normalized_path = Path(input_path.lstrip("/\\"))
-        # Set the absolute path
-        absolute_path = repository_directory / normalized_path
-        if absolute_path.exists():
-            logger.debug(f"Relative path '{input_path}' resolved as '{absolute_path}'")
+        if has_wildcard:
+            _process_wildcard_path(path, repository_directory, valid_paths, log_func)
         else:
-            logger.debug(f"Relative path '{input_path}' does not exist, provide a valid path")
+            _process_regular_path(path, repository_directory, valid_paths, log_func)
 
-        return absolute_path
+    return list(valid_paths)
 
-    absolute_path = Path(input_path)
-    if not absolute_path.exists():
-        logger.debug(f"Absolute path '{input_path}' does not exist, provide a valid path")
 
-    return absolute_path
+def _process_regular_path(
+    path: str, repository_directory: Path, valid_paths: set[Path], log_func: logging.Logger
+) -> None:
+    """Process a regular (non-wildcard) path and add to valid_paths if valid."""
+    # Normalize path for consistent handling
+    normalized_path = Path(path.lstrip("/\\"))
+
+    # Set the path type based on whether it is absolute or relative
+    path_type = "Relative" if not normalized_path.is_absolute() else "Absolute"
+
+    # Validate the path and add to set if valid
+    valid_path = _resolve_file_path(normalized_path, repository_directory, path_type, log_func)
+    if valid_path:
+        valid_paths.add(valid_path)
+
+
+def _process_wildcard_path(
+    path: str, repository_directory: Path, valid_paths: set[Path], log_func: logging.Logger
+) -> None:
+    """Process a wildcard path and add matching files to valid_paths if valid."""
+    search_pattern = _set_wildcard_path_pattern(path, repository_directory, log_func)
+
+    if not search_pattern:
+        return
+
+    # Track if matches are found
+    initial_paths_count = len(valid_paths)
+
+    # Get all matching files that exist
+    try:
+        for matched_path in [p for p in repository_directory.glob(search_pattern) if p.is_file()]:
+            # Validate path and add to set if valid
+            valid_path = _resolve_file_path(matched_path, repository_directory, "Wildcard", log_func)
+            if valid_path:
+                valid_paths.add(valid_path)
+
+        # Only log if matches were not found
+        if len(valid_paths) == initial_paths_count:
+            log_func(f"Wildcard path '{path}' did not match any files")
+
+    except Exception as e:
+        log_func(f"Error processing wildcard pattern '{search_pattern}': {e}")
+
+
+def _set_wildcard_path_pattern(wildcard_path: str, repository_directory: Path, log_func: logging.Logger) -> str:
+    """Determine the glob search pattern for a wildcard path."""
+    normalized_wildcard_path = wildcard_path.replace("\\", "/")
+
+    # Step 1: Validate wildcard pattern syntax
+    if not _validate_wildcard_syntax(normalized_wildcard_path, log_func):
+        return ""
+
+    # Step 2: Determine search pattern based on path type
+    if normalized_wildcard_path.startswith("**/"):
+        logger.debug("Recursive wildcard path detected")
+        return f"**/{normalized_wildcard_path[3:]}"
+
+    if Path(normalized_wildcard_path).is_absolute():
+        logger.debug("Absolute wildcard path detected")
+        try:
+            # Check if the path is within the repository
+            rel_path = Path(normalized_wildcard_path).relative_to(repository_directory)
+            return str(rel_path)
+        except ValueError:
+            log_func(f"Invalid absolute wildcard path. '{wildcard_path}' is outside the repository directory")
+            return ""
+    else:
+        logger.debug("Non-recursive and non-absolute wildcard path detected")
+        return normalized_wildcard_path
+
+
+def _resolve_file_path(
+    input_path: Path, repository_directory: Path, path_type: str, log_func: logging.Logger
+) -> Optional[Path]:
+    """
+    Validates that a path exists, is a file, and is within the repository directory.
+    Returns the resolved absolute path if valid, None otherwise.
+    """
+    try:
+        # Step 1: Resolve the input path based on its type
+        if path_type == "Relative":
+            resolved_path = (repository_directory / input_path).resolve()
+            logger.debug(f"{path_type} path '{input_path}' resolved as '{resolved_path}'")
+        elif path_type == "Absolute":
+            resolved_path = input_path.resolve()
+        else:
+            resolved_path = input_path
+
+        # Step 2: Check if the path is within the repository directory
+        try:
+            _ = resolved_path.relative_to(repository_directory)
+        except ValueError:
+            log_func(f"{path_type} path '{input_path}' is outside the repository directory")
+            return None
+
+        # Step 3: For non-wildcard paths, check existence and file type
+        if path_type != "Wildcard":
+            # Check path existence
+            if not resolved_path.exists():
+                log_func(f"{path_type} path '{input_path}' does not exist")
+                return None
+
+            # Check file validation
+            if not resolved_path.is_file():
+                log_func(f"{path_type} path '{input_path}' is not a file")
+                return None
+
+        logger.debug(f"Path '{resolved_path}' is valid and within the repository directory")
+        return resolved_path
+
+    except Exception as e:
+        log_func(f"Error validating {path_type.lower()} path '{input_path}': {e}")
+        return None
+
+
+def _validate_wildcard_syntax(pattern: str, log_func: logging.Logger) -> bool:
+    """Validates wildcard pattern syntax before using glob."""
+    # Check for empty or whitespace-only patterns
+    if not pattern or pattern.isspace():
+        log_func("Wildcard pattern is empty")
+        return False
+
+    # Check for problematic absolute paths with recursive patterns
+    if pattern.startswith("/") and pattern[1:].startswith("**/"):
+        log_func(f"Absolute path with recursive pattern is not allowed: '{pattern}'")
+        return False
+
+    # Handle Windows-style absolute paths with recursive patterns
+    if re.match(r"^[a-zA-Z]:\\", pattern) and "**\\" in pattern:
+        log_func(f"Absolute path with recursive pattern is not allowed: '{pattern}'")
+        return False
+
+    # Apply standard validations from constants
+    for validation in constants.WILDCARD_PATH_VALIDATIONS:
+        if validation["check"](pattern):
+            log_func(validation["message"](pattern))
+            return False
+
+    # Validate proper nesting of brackets and braces
+    if not _validate_nested_brackets_braces(pattern, log_func):
+        return False
+
+    # Validate character classes (bracket expressions)
+    for section in re.findall(r"\[(.*?)\]", pattern):
+        if not section or section.startswith("]") or section.startswith("-") or "--" in section:
+            log_func(f"Invalid character class in pattern: '{pattern}'")
+            return False
+
+    # Validate brace expansions
+    try:
+        for section in re.findall(r"\{(.*?)\}", pattern):
+            if (
+                not section  # Empty braces
+                or "," not in section  # No comma separator
+                or section.startswith(",")  # Starts with comma
+                or section.endswith(",")  # Ends with comma
+                or ",," in section
+            ):  # Adjacent commas
+                log_func(f"Invalid brace expansion in pattern: '{pattern}'")
+                return False
+
+    except Exception as e:
+        log_func(f"Error validating brace content in pattern '{pattern}': {e}")
+        return False
+
+    # Check for path traversal sequences
+    pattern_lower = pattern.lower()
+    traversal_patterns = [
+        "../",
+        ".." + os.sep,
+        ".." + os.altsep if os.altsep else "",
+        "..%2F",
+        "..%5C",
+        "..%2f",
+        "..%5c",
+    ]
+
+    for traversal in traversal_patterns:
+        if traversal and traversal in pattern_lower:
+            log_func(f"Path traversal sequences not allowed: '{pattern}'")
+            return False
+
+    return True
+
+
+def _validate_nested_brackets_braces(pattern: str, log_func: logging.Logger) -> bool:
+    """Validates proper nesting of brackets and braces in a wildcard pattern."""
+    stack = []
+
+    for pos, char in enumerate(pattern):
+        if char in "[{":
+            stack.append(char)
+        elif char in "]}":
+            # Check if stack is empty (closing without opening)
+            if not stack:
+                log_func(f"Unmatched closing '{char}' at position {pos} in pattern: '{pattern}'")
+                return False
+
+            # Check for proper matching
+            last_open = stack.pop()
+            if (char == "]" and last_open != "[") or (char == "}" and last_open != "{"):
+                log_func(f"Mismatched bracket/brace pair '{last_open}{char}' at position {pos} in pattern: '{pattern}'")
+                return False
+
+    # Check if all brackets and braces were closed
+    if stack:
+        log_func(f"Unclosed bracket(s) or brace(s) in pattern: '{pattern}'")
+        return False
+
+    return True
+
+
+"""Functions to determine replacement based on optional filters"""
 
 
 def check_replacement(
     input_type: Union[str, list[str], None],
     input_name: Union[str, list[str], None],
-    input_path: Union[Path, list[str], None],
+    input_path: Union[list[Path], None],
     item_type: str,
     item_name: str,
     file_path: Path,
@@ -197,13 +836,11 @@ def check_replacement(
         file_path: The file_path value to compare with.
     """
     # No optional parameters found
-    if not input_type and not input_name and not input_path:
+    if input_type is None and input_name is None and input_path is None:
         logger.debug("No optional filters found. Find and replace applied in this repository file")
         return True
 
     # Otherwise, find matches for the optional parameters
-    logger.debug("Optional filters found. Checking for matches")
-
     item_type_match = _find_match(input_type, item_type)
     item_name_match = _find_match(input_name, item_name)
     file_path_match = _find_match(input_path, file_path)
@@ -216,15 +853,15 @@ def check_replacement(
         if input_path:
             logger.debug(f"File path match found: {file_path_match}")
 
-        logger.debug("Optional filters match found. Find and replace applied in this repository file")
+        # Optional filters match found. Find and replace applied in this repository file
         return True
 
-    logger.debug("Optional filters match not found. Find and replace skipped for this repository file")
+    # Optional filters match not found. Find and replace skipped for this repository file
     return False
 
 
 def _find_match(
-    param_value: Union[str, list, Path, None],
+    param_value: Union[str, list, None],
     compare_value: Union[str, Path],
 ) -> bool:
     """
@@ -236,7 +873,7 @@ def _find_match(
         compare_value: The value to compare with.
     """
     # If no parameter value, checking for matches is not required
-    if not param_value:
+    if param_value is None:
         return True
 
     # Otherwise, check for matches based on the parameter value type

@@ -62,7 +62,7 @@ def generate_mock_jwt(authtype=""):
 
 def test_integration(setup_mocks):
     """Test integration of FabricEndpoint for GET request."""
-    dl, mock_requests = setup_mocks
+    _, mock_requests = setup_mocks
     mock_requests.return_value = Mock(
         status_code=200, headers={"Content-Type": "application/json"}, json=Mock(return_value={})
     )
@@ -75,7 +75,7 @@ def test_integration(setup_mocks):
 
 def test_performance(setup_mocks):
     """Test that _handle_response completes quickly under long-running simulation."""
-    dl, mock_requests = setup_mocks
+    _, _mock_requests = setup_mocks
     response = Mock(status_code=200, headers={}, json=Mock(return_value={"status": "Succeeded"}))
     start_time = time.time()
     _handle_response(
@@ -100,7 +100,7 @@ def test_performance(setup_mocks):
 )
 def test_invoke(setup_mocks, method, url, body, files):
     """Test FabricEndpoint invoke method success + with optional files."""
-    dl, mock_requests = setup_mocks
+    _, mock_requests = setup_mocks
     mock_requests.return_value = Mock(
         status_code=200, headers={"Content-Type": "application/json"}, json=Mock(return_value={})
     )
@@ -134,13 +134,101 @@ def test_invoke_token_expired(setup_mocks, monkeypatch):
 
 def test_invoke_exception(setup_mocks):
     """Test invoking endpoint when the AAD token is expired and refreshed."""
-    dl, mock_requests = setup_mocks
+    _, mock_requests = setup_mocks
     mock_requests.side_effect = Exception("Test exception")
     mock_token_credential = Mock()
     mock_token_credential.get_token.return_value.token = generate_mock_jwt()
     endpoint = FabricEndpoint(token_credential=mock_token_credential)
     with pytest.raises(InvokeError):
         endpoint.invoke("GET", "http://example.com")
+
+
+def test_invoke_poll_long_running_false_with_202(setup_mocks):
+    """Test invoke method with poll_long_running=False exits early on 202 response."""
+    _, mock_requests = setup_mocks
+    mock_requests.return_value = Mock(
+        status_code=202,
+        headers={"Content-Type": "application/json", "Location": "http://example.com/status"},
+        json=Mock(return_value={}),
+    )
+    mock_token_credential = Mock()
+    mock_token_credential.get_token.return_value.token = generate_mock_jwt()
+    endpoint = FabricEndpoint(token_credential=mock_token_credential)
+
+    response = endpoint.invoke("POST", "http://example.com", poll_long_running=False)
+
+    # Should exit immediately without polling
+    assert response["status_code"] == 202
+    assert mock_requests.call_count == 1  # Only one request, no polling
+
+
+def test_invoke_poll_long_running_true_with_202(setup_mocks, monkeypatch):
+    """Test invoke method with poll_long_running=True polls on 202 response."""
+    _, mock_requests = setup_mocks
+
+    # First call returns 202 with Location header, second call returns 200 with Succeeded status
+    mock_requests.side_effect = [
+        Mock(
+            status_code=202,
+            headers={"Content-Type": "application/json", "Location": "http://example.com/status"},
+            json=Mock(return_value={}),
+            text="{}",
+        ),
+        Mock(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            json=Mock(return_value={"status": "Succeeded"}),
+            text='{"status": "Succeeded"}',
+        ),
+    ]
+
+    mock_token_credential = Mock()
+    mock_token_credential.get_token.return_value.token = generate_mock_jwt()
+    endpoint = FabricEndpoint(token_credential=mock_token_credential)
+
+    # Mock time.sleep to avoid delays in tests
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    response = endpoint.invoke("POST", "http://example.com", poll_long_running=True)
+
+    # Should poll and return final status
+    assert response["status_code"] == 200
+    assert mock_requests.call_count == 2  # Initial request + polling request
+
+
+def test_invoke_poll_long_running_default_with_202(setup_mocks, monkeypatch):
+    """Test invoke method with default poll_long_running (True) polls on 202 response."""
+    _, mock_requests = setup_mocks
+
+    # First call returns 202 with Location header, second call returns 200 with Succeeded status
+    mock_requests.side_effect = [
+        Mock(
+            status_code=202,
+            headers={"Content-Type": "application/json", "Location": "http://example.com/status"},
+            json=Mock(return_value={}),
+            text="{}",
+        ),
+        Mock(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            json=Mock(return_value={"status": "Succeeded"}),
+            text='{"status": "Succeeded"}',
+        ),
+    ]
+
+    mock_token_credential = Mock()
+    mock_token_credential.get_token.return_value.token = generate_mock_jwt()
+    endpoint = FabricEndpoint(token_credential=mock_token_credential)
+
+    # Mock time.sleep to avoid delays in tests
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    # Don't pass poll_long_running, should default to True
+    response = endpoint.invoke("POST", "http://example.com")
+
+    # Should poll and return final status
+    assert response["status_code"] == 200
+    assert mock_requests.call_count == 2  # Initial request + polling request
 
 
 @pytest.mark.parametrize(
@@ -190,7 +278,7 @@ def test_refresh_token_no_exp_claim(monkeypatch):
     test_token = "dummy_token_value"
     credential = DummyCredential(test_token)
     monkeypatch.setattr("fabric_cicd._common._fabric_endpoint._decode_jwt", lambda _: {"upn": "user@example.com"})
-    with pytest.raises(TokenError, match="Token does not contain expiration claim."):
+    with pytest.raises(TokenError, match=r"Token does not contain expiration claim."):
         FabricEndpoint(token_credential=credential)
 
 
@@ -233,7 +321,7 @@ def test_handle_response(
     """Test _handle_response behavior for various HTTP responses and long-running operations."""
     response = Mock(status_code=status_code, headers=response_header, json=Mock(return_value=response_json))
 
-    exit_loop, _method, url, _body, long_running = _handle_response(
+    exit_loop, _method, _url, _body, long_running = _handle_response(
         response=response,
         method=request_method,
         url="old",
@@ -279,6 +367,8 @@ def test_handle_response_longrunning_exception(exception_match, response_json):
         "response_header",
         "return_value",
         "exception_match",
+        "max_duration",
+        "start_time",
     ),
     [
         (
@@ -288,6 +378,8 @@ def test_handle_response_longrunning_exception(exception_match, response_json):
             {"x-ms-public-api-error-code": "Unauthorized"},
             {},
             "The executing identity is not authorized to call GET on 'http://example.com'.",
+            None,
+            None,
         ),
         (
             400,
@@ -296,6 +388,8 @@ def test_handle_response_longrunning_exception(exception_match, response_json):
             {"x-ms-public-api-error-code": "PrincipalTypeNotSupported"},
             {},
             "The executing principal type is not supported to call GET on 'http://example.com'.",
+            None,
+            None,
         ),
         (
             400,
@@ -304,27 +398,38 @@ def test_handle_response_longrunning_exception(exception_match, response_json):
             {"x-ms-public-api-error-code": "PrincipalTypeNotSupported"},
             {"message": "Test Libabry is not present in the environment."},
             "Deployment attempted to remove a library that is not present in the environment. ",
+            None,
+            None,
         ),
         (
             500,
-            1,
+            5,
             False,
             {"Content-Type": "application/json"},
             {"message": "Internal Server Error"},
-            "Unhandled error occurred calling GET on 'http://example.com'. Message: Internal Server Error",
+            r"Maximum execution duration \(0 seconds\) exceeded",
+            0,
+            0.0,
         ),
-        (429, 5, True, {"Retry-After": "10"}, {}, r"Maximum retry attempts \(5\) exceeded."),
+        (429, 5, True, {"Retry-After": "10"}, {}, r"Maximum execution duration \(0 seconds\) exceeded", 0, 0.0),
     ],
     ids=[
         "unauthorized",
         "principal_type_not_supported",
         "failed_library_removal",
-        "unexpected_error",
-        "retry",
+        "retry_500",
+        "retry_429",
     ],
 )
 def test_handle_response_exceptions(
-    status_code, input_iteration_count, input_long_running, response_header, return_value, exception_match
+    status_code,
+    input_iteration_count,
+    input_long_running,
+    response_header,
+    return_value,
+    exception_match,
+    max_duration,
+    start_time,
 ):
     """Test _handle_response raises appropriate exceptions based on response error codes."""
     response = Mock(status_code=status_code, headers=response_header, json=Mock(return_value=return_value))
@@ -336,13 +441,15 @@ def test_handle_response_exceptions(
             body="{}",
             long_running=input_long_running,
             iteration_count=input_iteration_count,
+            max_duration=max_duration,
+            start_time=start_time,
         )
 
 
 def test_handle_response_feature_not_available():
     """Test _handle_response for feature not available"""
     response = Mock(status_code=403, reason="FeatureNotAvailable")
-    with pytest.raises(Exception, match="Item type not supported. Description: FeatureNotAvailable"):
+    with pytest.raises(Exception, match=r"Item type not supported. Description: FeatureNotAvailable"):
         _handle_response(
             response=response,
             method="GET",
@@ -353,20 +460,27 @@ def test_handle_response_feature_not_available():
         )
 
 
-def test_handle_response_item_display_name_already_in_use(setup_mocks):
-    """Test _handle_response logs a retry message when item display name is already in use."""
-    dl, mock_requests = setup_mocks
-    response = Mock(status_code=400, headers={"x-ms-public-api-error-code": "ItemDisplayNameAlreadyInUse"})
-    _handle_response(response, "GET", "http://example.com", "{}", False, 1)
-    expected = f"{constants.INDENT}Item name is reserved. Checking again in 60 seconds (Attempt 1/5)..."
+def test_handle_response_item_display_name_already_in_use(setup_mocks, monkeypatch):
+    """
+    Test _handle_response logs a retry message when item display name is already in use.
+
+    Mocks time.sleep to avoid actual test execution delays.
+    """
+    import time
+
+    dl, _mock_requests = setup_mocks
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    response = Mock(status_code=400, headers={"x-ms-public-api-error-code": "ItemDisplayNameNotAvailableYet"})
+    _handle_response(response, "GET", "http://example.com", "{}", False, 1, max_duration=300, start_time=time.time())
+    expected = f"{constants.INDENT}Item name is reserved. Checking again in 60 seconds (Attempt 1)..."
     assert dl.messages == [expected]
 
 
 def test_handle_response_environment_libraries_not_found(setup_mocks):
     """Test _handle_response exits loop when environment libraries are not found (404)."""
-    dl, mock_requests = setup_mocks
+    _, _mock_requests = setup_mocks
     response = Mock(status_code=404, headers={"x-ms-public-api-error-code": "EnvironmentLibrariesNotFound"})
-    exit_loop, method, url, body, long_running = _handle_response(
+    exit_loop, _method, _url, _body, long_running = _handle_response(
         response=response,
         method="GET",
         url="http://example.com",
@@ -397,3 +511,72 @@ def test_format_invoke_log():
     log_message = _format_invoke_log(response, "GET", "http://example.com", "{}")
     assert "Method: GET" in log_message
     assert "URL: http://example.com" in log_message
+
+
+def test_is_fabric_runtime_returns_false():
+    """Test _is_fabric_runtime returns False when not running in Fabric Notebook environment."""
+    from fabric_cicd._common._fabric_endpoint import _is_fabric_runtime
+
+    # When running tests, we're not in a Fabric Runtime environment
+    # so _is_fabric_runtime should return False
+    assert _is_fabric_runtime() is False
+
+
+def test_generate_fabric_credential(monkeypatch):
+    """Test _generate_fabric_credential returns a TokenCredential that can get tokens."""
+    import builtins
+
+    from fabric_cicd._common._fabric_endpoint import _generate_fabric_credential
+
+    # Mock notebookutils and get_ipython
+    mock_notebookutils = Mock()
+    mock_notebookutils.credentials.getToken.return_value = generate_mock_jwt()
+
+    mock_ipython = Mock()
+    mock_ipython.user_ns.get.return_value = mock_notebookutils
+
+    # Patch get_ipython as a new attribute on builtins module
+    monkeypatch.setattr(builtins, "get_ipython", lambda: mock_ipython, raising=False)
+
+    # Generate the credential
+    credential = _generate_fabric_credential()
+
+    # Verify it's a TokenCredential that can get tokens
+    assert credential is not None
+    token = credential.get_token()
+
+    # Verify the token has the expected structure
+    assert token.token is not None
+    assert token.expires_on is not None
+
+    # Verify notebookutils.credentials.getToken was called
+    mock_notebookutils.credentials.getToken.assert_called_once_with("pbi")
+
+
+def test_generate_fabric_credential_fallback_expiration(monkeypatch):
+    """Test _generate_fabric_credential uses fallback expiration when JWT parsing fails."""
+    import builtins
+    import time
+
+    from fabric_cicd._common._fabric_endpoint import _generate_fabric_credential
+
+    # Mock notebookutils to return an invalid JWT token
+    mock_notebookutils = Mock()
+    mock_notebookutils.credentials.getToken.return_value = "invalid.jwt.token"
+
+    mock_ipython = Mock()
+    mock_ipython.user_ns.get.return_value = mock_notebookutils
+
+    # Patch get_ipython as a new attribute on builtins module
+    monkeypatch.setattr(builtins, "get_ipython", lambda: mock_ipython, raising=False)
+
+    # Generate the credential
+    credential = _generate_fabric_credential()
+
+    # Get token - should use fallback expiration (current time + 1 hour)
+    current_time = int(time.time())
+    token = credential.get_token()
+
+    # Verify the token uses fallback expiration (~1 hour from now)
+    assert token.expires_on >= current_time + 3500  # ~58 minutes
+    assert token.expires_on <= current_time + 3700  # ~62 minutes

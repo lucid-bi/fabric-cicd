@@ -4,84 +4,65 @@
 """Functions to process and deploy Environment item."""
 
 import logging
-import os
+import re
 from pathlib import Path
 
 import dpath
 import yaml
 
 from fabric_cicd import FabricWorkspace, constants
+from fabric_cicd._common._exceptions import MissingFileError
 from fabric_cicd._common._fabric_endpoint import handle_retry
-from fabric_cicd._parameter._utils import check_parameter_structure
+from fabric_cicd._common._item import Item
+from fabric_cicd._items._base_publisher import ItemPublisher
+from fabric_cicd.constants import EXCLUDE_PATH_REGEX_MAPPING, ItemType
 
 logger = logging.getLogger(__name__)
 
 
-def publish_environments(fabric_workspace_obj: FabricWorkspace) -> None:
+def set_environment_deployment_type(item: Item) -> bool:
     """
-    Publishes all environment items from the repository.
+    Return True if this Environment deployment should be treated as "shell-only".
 
-    Environments can only deploy the shell; compute and spark configurations are published separately.
+    Shell-only when `Setting/Sparkcompute.yml` exists and there are no other
+    non-`.platform` repository files under the environment root.
 
     Args:
-        fabric_workspace_obj: The FabricWorkspace object containing the items to be published.
+        item: The Item object representing the Environment.
     """
-    # Check for ongoing publish
-    check_environment_publish_state(fabric_workspace_obj, True)
+    root = Path(item.path) if item.path else None
+    shell_only = False
 
-    item_type = "Environment"
-    for item_name in fabric_workspace_obj.repository_items.get(item_type, {}):
-        # Only deploy the shell for environments
-        fabric_workspace_obj._publish_item(
-            item_name=item_name,
-            item_type=item_type,
-            skip_publish_logging=True,
-        )
-        _publish_environment_metadata(fabric_workspace_obj, item_name=item_name)
+    for file in item.item_files:
+        fp = file.file_path
+
+        # Ignore .platform metadata file
+        if fp.name == ".platform":
+            continue
+
+        # Use the path relative to the environment root, or full path if root is None
+        try:
+            rel_path = fp.relative_to(root) if root else fp
+        except ValueError:
+            logger.debug(f"Path '{fp}' is not relative to root '{root}'; using full path")
+            rel_path = fp
+
+        path_parts = list(rel_path.parts)
+        # Detect Setting/Sparkcompute.yml (case-sensitive)
+        if len(path_parts) >= 2 and path_parts[0] == "Setting" and path_parts[1] == "Sparkcompute.yml":
+            shell_only = True
+            # Continue checking for other non-.platform files
+            continue
+
+        # Any other files -> not shell-only
+        return False
+
+    return shell_only
 
 
-def _publish_environment_metadata(fabric_workspace_obj: FabricWorkspace, item_name: str) -> None:
+def _check_environment_publish_state(fabric_workspace_obj: FabricWorkspace, initial_check: bool = False) -> None:
     """
-    Publishes compute settings and libraries for a given environment item.
-
-    This process involves two steps:
-    1. Check for ongoing publish.
-    2. Updating the compute settings.
-    3. Uploading/overwrite libraries to the environment.
-    4. Delete libraries in the environment that are not present in repository.
-    5. Publish the updated settings.
-
-    Args:
-        fabric_workspace_obj: The FabricWorkspace object.
-        item_name: Name of the environment item whose compute settings are to be published.
-    """
-    item_type = "Environment"
-    item_path = fabric_workspace_obj.repository_items[item_type][item_name].path
-    item_guid = fabric_workspace_obj.repository_items[item_type][item_name].guid
-
-    # Update compute settings
-    _update_compute_settings(fabric_workspace_obj, item_path, item_guid, item_name)
-
-    repo_library_files = _get_repo_libraries(item_path)
-
-    # Add libraries to environment, overwriting anything with the same name and return the list of libraries
-    _add_libraries(fabric_workspace_obj, item_guid, repo_library_files)
-
-    # Remove libraries from live environment that are not in the repository
-    _remove_libraries(fabric_workspace_obj, item_guid, repo_library_files)
-
-    # Publish updated settings
-    # https://learn.microsoft.com/en-us/rest/api/fabric/environment/spark-libraries/publish-environment
-    fabric_workspace_obj.endpoint.invoke(
-        method="POST", url=f"{fabric_workspace_obj.base_api_url}/environments/{item_guid}/staging/publish"
-    )
-
-    logger.info(f"{constants.INDENT}Publish Submitted")
-
-
-def check_environment_publish_state(fabric_workspace_obj: FabricWorkspace, initial_check: bool = False) -> None:
-    """
-    Checks the publish state of environments after deployment
+    Checks the publish state of environments after deployment.
 
     Args:
         fabric_workspace_obj: The FabricWorkspace object.
@@ -90,12 +71,30 @@ def check_environment_publish_state(fabric_workspace_obj: FabricWorkspace, initi
     ongoing_publish = True
     iteration = 1
 
-    environments = fabric_workspace_obj.repository_items.get("Environment", {})
+    environments = fabric_workspace_obj.repository_items.get(ItemType.ENVIRONMENT.value, {})
+    filtered_environments = [
+        k
+        for k in environments
+        if (
+            # Check exclude regex
+            (
+                not fabric_workspace_obj.publish_item_name_exclude_regex
+                or not re.search(fabric_workspace_obj.publish_item_name_exclude_regex, k)
+            )
+            # Check items_to_include list
+            and (
+                not fabric_workspace_obj.items_to_include or k + ".Environment" in fabric_workspace_obj.items_to_include
+            )
+        )
+    ]
 
-    logger.info(f"Checking Environment Publish State for {[k for k in environments]}")
+    logger.info(f"Checking Environment Publish State for {filtered_environments}")
 
     while ongoing_publish:
         ongoing_publish = False
+        completed = []
+        running = []
+        failed = []
 
         response_state = fabric_workspace_obj.endpoint.invoke(
             method="GET", url=f"{fabric_workspace_obj.base_api_url}/environments/"
@@ -104,165 +103,117 @@ def check_environment_publish_state(fabric_workspace_obj: FabricWorkspace, initi
         for item in response_state["body"]["value"]:
             item_name = item["displayName"]
             item_state = dpath.get(item, "properties/publishDetails/state", default="").lower()
-            if item_name in environments and item_state == "running":
-                ongoing_publish = True
-            elif item_state in ["failed", "cancelled"] and not initial_check:
-                msg = f"Publish {item_state} for {item_name}"
-                raise Exception(msg)
-
+            if item_name in filtered_environments:
+                if item_state == "running":
+                    running.append(item_name)
+                    ongoing_publish = True
+                elif item_state == "success":
+                    completed.append(item_name)
+                elif item_state in ["failed", "cancelled"]:
+                    failed.append(item_name)
+                    if not initial_check:
+                        msg = f"Publish {item_state} for Environment '{item_name}'"
+                        raise Exception(msg)
+        logger.debug(
+            f"Environment publish states - Running: {running}, Succeeded: {completed}, Failed/Cancelled: {failed}"
+        )
         if ongoing_publish:
             handle_retry(
                 attempt=iteration,
                 base_delay=5,
-                max_retries=20,
                 response_retry_after=120,
                 prepend_message=f"{constants.INDENT}Operation in progress.",
             )
             iteration += 1
 
     if not initial_check:
-        logger.info(f"{constants.INDENT}Published.")
+        logger.info(f"{constants.INDENT}Published: {completed}")
 
 
-def _update_compute_settings(
-    fabric_workspace_obj: FabricWorkspace, item_path: Path, item_guid: str, item_name: str
-) -> None:
+def _publish_environment_metadata(fabric_workspace_obj: FabricWorkspace, item_name: str) -> None:
+    """
+    Updates compute settings and publishes compute settings and libraries for a given environment item.
+
+    This process involves two steps:
+    1. Check for ongoing publish.
+    2. Updating the compute settings.
+    3. Publish the updated settings and libraries.
+
+    Args:
+        fabric_workspace_obj: The FabricWorkspace object.
+        item_name: Name of the environment item whose compute settings are to be published.
+        is_excluded: Flag indicating if Sparkcompute.yml was excluded from definition deployment.
+    """
+    item_type = ItemType.ENVIRONMENT.value
+    item_guid = fabric_workspace_obj.repository_items[item_type][item_name].guid
+
+    # Update compute settings
+    _update_compute_settings(fabric_workspace_obj, item_guid, item_name)
+
+    # Publish updated settings - compute settings and libraries (long-running operation)
+    # https://learn.microsoft.com/en-us/rest/api/fabric/environment/items/publish-environment
+    fabric_workspace_obj.endpoint.invoke(
+        method="POST",
+        url=f"{fabric_workspace_obj.base_api_url}/environments/{item_guid}/staging/publish?beta=False",
+        poll_long_running=False,
+    )
+    logger.info(f"{constants.INDENT}Publish Submitted for Environment '{item_name}'")
+
+
+def _update_compute_settings(fabric_workspace_obj: FabricWorkspace, item_guid: str, item_name: str) -> None:
     """
     Update spark compute settings.
 
     Args:
         fabric_workspace_obj: The FabricWorkspace object.
-        item_path: The path to the environment item.
         item_guid: The GUID of the environment item.
         item_name: Name of the environment item.
     """
-    # Read compute settings from YAML file
-    with Path.open(Path(item_path, "Setting", "Sparkcompute.yml"), "r+", encoding="utf-8") as f:
-        yaml_body = yaml.safe_load(f)
+    from fabric_cicd._parameter._utils import process_environment_key
 
-        # Update instance pool settings if present
-        if "instance_pool_id" in yaml_body:
-            pool_id = yaml_body["instance_pool_id"]
-            if "spark_pool" in fabric_workspace_obj.environment_parameter:
-                structure_type = check_parameter_structure(fabric_workspace_obj.environment_parameter, "spark_pool")
-                parameter_dict = fabric_workspace_obj.environment_parameter["spark_pool"]
-                # Handle new parameter file format
-                if structure_type == "new":
-                    for key in parameter_dict:
-                        instance_pool_id = key["instance_pool_id"]
-                        replace_value = key["replace_value"]
-                        input_name = key.get("item_name")
-                        if instance_pool_id == pool_id and (input_name == item_name or not input_name):
-                            # replace any found references with specified environment value
-                            yaml_body["instancePool"] = replace_value[fabric_workspace_obj.environment]
-                            del yaml_body["instance_pool_id"]
+    # Get Setting/Sparkcompute.yml content from repository
+    yaml_contents = None
+    item = fabric_workspace_obj.repository_items[ItemType.ENVIRONMENT.value][item_name]
+    item_files = item.item_files
+    for file in item_files:
+        if file.file_path.name == "Sparkcompute.yml" and file.file_path.parent.name == "Setting":
+            file.contents = fabric_workspace_obj._replace_parameters(file, item)
+            yaml_contents = file.contents
+            break
 
-                # Handle original parameter file format
-                # TODO: Deprecate old structure handling by April 24, 2025
-                if structure_type == "old" and pool_id in parameter_dict:
+    if not yaml_contents:
+        msg = (
+            "Required file missing: Setting/Sparkcompute.yml for Environment "
+            f"'{item_name}'. Each Environment must include Setting/Sparkcompute.yml."
+        )
+        raise MissingFileError(msg, logger)
+
+    yaml_body = yaml.safe_load(yaml_contents)
+
+    # Update instance pool settings if present
+    if "instance_pool_id" in yaml_body:
+        pool_id = yaml_body["instance_pool_id"]
+        if "spark_pool" in fabric_workspace_obj.environment_parameter:
+            parameter_dict = fabric_workspace_obj.environment_parameter["spark_pool"]
+            for key in parameter_dict:
+                instance_pool_id = key["instance_pool_id"]
+                replace_value = process_environment_key(fabric_workspace_obj.environment, key["replace_value"])
+                input_name = key.get("item_name")
+                if instance_pool_id == pool_id and (input_name == item_name or not input_name):
                     # replace any found references with specified environment value
-                    yaml_body["instancePool"] = parameter_dict[pool_id]
+                    yaml_body["instancePool"] = replace_value[fabric_workspace_obj.environment]
                     del yaml_body["instance_pool_id"]
 
-        yaml_body = _convert_environment_compute_to_camel(fabric_workspace_obj, yaml_body)
+    yaml_body = _convert_environment_compute_to_camel(fabric_workspace_obj, yaml_body)
 
-        # Update compute settings
-        # https://learn.microsoft.com/en-us/rest/api/fabric/environment/spark-compute/update-staging-settings
-        fabric_workspace_obj.endpoint.invoke(
-            method="PATCH",
-            url=f"{fabric_workspace_obj.base_api_url}/environments/{item_guid}/staging/sparkcompute",
-            body=yaml_body,
-        )
-        logger.info(f"{constants.INDENT}Updated Spark Settings")
-
-
-def _get_repo_libraries(item_path: Path) -> dict:
-    """
-    Add libraries to environment, overwriting anything with the same name and returns a list of the libraries in the repo.
-
-    Args:
-        item_path: The path to the environment item.
-    """
-    repo_library_files = {}
-
-    repo_library_path = Path(item_path, "Libraries")
-    if repo_library_path.exists():
-        for root, _dirs, files in os.walk(repo_library_path):
-            for file_name in files:
-                repo_library_files[file_name] = Path(root, file_name)
-
-    return repo_library_files
-
-
-def _add_libraries(fabric_workspace_obj: FabricWorkspace, item_guid: str, repo_library_files: dict) -> None:
-    """
-    Add libraries to environment, overwriting anything with the same name.
-
-    Args:
-        fabric_workspace_obj: The FabricWorkspace object.
-        item_guid: The GUID of the environment item.
-        repo_library_files: The list of libraries in the repository.
-    """
-    for file_name, file_path in repo_library_files.items():
-        library_file = {"file": (file_name, file_path.open("rb"))}
-
-        # Upload libraries From Repo
-        # https://learn.microsoft.com/en-us/rest/api/fabric/environment/spark-libraries/upload-staging-library
-        fabric_workspace_obj.endpoint.invoke(
-            method="POST",
-            url=f"{fabric_workspace_obj.base_api_url}/environments/{item_guid}/staging/libraries",
-            files=library_file,
-        )
-        logger.info(f"{constants.INDENT}Updated Library {file_path.name}")
-
-
-def _remove_libraries(fabric_workspace_obj: FabricWorkspace, item_guid: str, repo_library_files: dict) -> None:
-    """
-    Remove libraries not in repository.
-
-    Args:
-        fabric_workspace_obj: The FabricWorkspace object.
-        item_guid: The GUID of the environment item.
-        repo_library_files: The list of libraries in the repository.
-
-    """
-    # Get staged libraries
-    # https://learn.microsoft.com/en-us/rest/api/fabric/environment/spark-libraries/get-staging-libraries
-    response_environment = fabric_workspace_obj.endpoint.invoke(
-        method="GET", url=f"{fabric_workspace_obj.base_api_url}/environments/{item_guid}/staging/libraries"
-    )
-
-    if response_environment["body"].get("errorCode", "") != "EnvironmentLibrariesNotFound":
-        if (
-            "environmentYml" in response_environment["body"]
-            and response_environment["body"]["environmentYml"]  # not none or ''
-            and "environment.yml" not in repo_library_files
-        ):
-            _remove_library(fabric_workspace_obj, item_guid, "environment.yml")
-
-        custom_libraries = response_environment["body"].get("customLibraries", None)
-        if custom_libraries:
-            for files in custom_libraries.values():
-                for file in files:
-                    if file not in repo_library_files:
-                        _remove_library(fabric_workspace_obj, item_guid, file)
-
-
-def _remove_library(fabric_workspace_obj: FabricWorkspace, item_guid: str, file_name: str) -> None:
-    """Remove library from workspace environment.
-
-    Args:
-        fabric_workspace_obj: The FabricWorkspace object.
-        item_guid: The GUID of the environment item.
-        file_name: The name of the file to be removed.
-    """
-    # https://learn.microsoft.com/en-us/rest/api/fabric/environment/spark-libraries/delete-staging-library
+    # Update compute settings
+    # https://learn.microsoft.com/en-us/rest/api/fabric/environment/staging/update-spark-compute
     fabric_workspace_obj.endpoint.invoke(
-        method="DELETE",
-        url=f"{fabric_workspace_obj.base_api_url}/environments/{item_guid}/staging/libraries?libraryToDelete={file_name}",
-        body={},
+        method="PATCH",
+        url=f"{fabric_workspace_obj.base_api_url}/environments/{item_guid}/staging/sparkcompute?beta=False",
+        body=yaml_body,
     )
-    logger.info(f"{constants.INDENT}Removed {file_name}")
+    logger.info(f"{constants.INDENT}Updated Spark Settings")
 
 
 def _convert_environment_compute_to_camel(fabric_workspace_obj: FabricWorkspace, input_dict: dict) -> dict:
@@ -277,18 +228,51 @@ def _convert_environment_compute_to_camel(fabric_workspace_obj: FabricWorkspace,
 
     for key, value in input_dict.items():
         if key == "spark_conf":
+            # Convert spark_conf dict to sparkProperties list of {key, value} objects
             new_key = "sparkProperties"
+            # Ensure value is treated as a mapping
+            if isinstance(value, dict):
+                value = [{"key": k, "value": v} for k, v in value.items()]
         else:
             # Convert the key to camelCase
             key_components = key.split("_")
-            # Capitalize the first letter of each component except the first one
             new_key = key_components[0] + "".join(x.title() for x in key_components[1:])
 
         # Recursively update dictionary values if they are dictionaries
         if isinstance(value, dict):
             value = _convert_environment_compute_to_camel(fabric_workspace_obj, value)
 
-        # Add the new key-value pair to the new dictionary
         new_input_dict[new_key] = value
 
     return new_input_dict
+
+
+class EnvironmentPublisher(ItemPublisher):
+    """Publisher for Environment items."""
+
+    item_type = ItemType.ENVIRONMENT.value
+    has_async_publish_check = True
+
+    def publish_one(self, item_name: str, item: Item) -> None:
+        """Publish a single Environment item."""
+        is_shell_only = set_environment_deployment_type(item)
+        logger.debug(f"Environment '{item_name}'; shell_only deployment: {is_shell_only}")
+
+        self.fabric_workspace_obj._publish_item(
+            item_name=item_name,
+            item_type=self.item_type,
+            exclude_path=EXCLUDE_PATH_REGEX_MAPPING.get(self.item_type),
+            skip_publish_logging=True,
+            shell_only_publish=is_shell_only,
+        )
+        if item.skip_publish:
+            return
+        _publish_environment_metadata(self.fabric_workspace_obj, item_name)
+
+    def pre_publish_all(self) -> None:
+        """Check environment publish state before publishing."""
+        _check_environment_publish_state(self.fabric_workspace_obj, True)
+
+    def post_publish_all_check(self) -> None:
+        """Check environment publish state after all environments have been published."""
+        _check_environment_publish_state(self.fabric_workspace_obj, False)

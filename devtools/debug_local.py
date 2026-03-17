@@ -37,11 +37,18 @@ repository_directory = str(root_directory / "sample" / "workspace")
 item_type_in_scope = [
     "Lakehouse",
     "VariableLibrary",
+    "Dataflow",
     "DataPipeline",
     "Notebook",
     "Environment",
     "SemanticModel",
     "Report",
+    "Eventhouse",
+    "KQLDatabase",
+    "KQLQueryset",
+    "Reflex",
+    "Eventstream",
+    "SparkJobDefinition",
 ]
 
 # Uncomment to use SPN auth

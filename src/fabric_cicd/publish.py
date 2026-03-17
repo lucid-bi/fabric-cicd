@@ -12,18 +12,20 @@ from azure.core.credentials import TokenCredential
 import fabric_cicd._items as items
 from fabric_cicd import constants
 from fabric_cicd._common._config_utils import (
-    apply_config_overrides,
+    config_overrides_scope,
     extract_publish_settings,
     extract_unpublish_settings,
     extract_workspace_settings,
     load_config_file,
 )
-from fabric_cicd._common._exceptions import FailedPublishedItemStatusError
+from fabric_cicd._common._deployment_result import DeploymentResult, DeploymentStatus
+from fabric_cicd._common._exceptions import FailedPublishedItemStatusError, InputError
 from fabric_cicd._common._logging import log_header
 from fabric_cicd._common._validate_input import (
     validate_environment,
     validate_fabric_workspace_obj,
     validate_folder_path_exclude_regex,
+    validate_folder_path_to_include,
     validate_items_to_include,
     validate_shortcut_exclude_regex,
 )
@@ -37,6 +39,7 @@ def publish_all_items(
     fabric_workspace_obj: FabricWorkspace,
     item_name_exclude_regex: Optional[str] = None,
     folder_path_exclude_regex: Optional[str] = None,
+    folder_path_to_include: Optional[list[str]] = None,
     items_to_include: Optional[list[str]] = None,
     shortcut_exclude_regex: Optional[str] = None,
 ) -> Optional[dict]:
@@ -46,7 +49,8 @@ def publish_all_items(
     Args:
         fabric_workspace_obj: The FabricWorkspace object containing the items to be published.
         item_name_exclude_regex: Regex pattern to exclude specific items from being published.
-        folder_path_exclude_regex: Regex pattern to exclude items based on their folder path.
+        folder_path_exclude_regex: Regex pattern matched against folder paths (e.g., "/folder_name") to exclude folders and their items from being published.
+        folder_path_to_include: List of folder paths in the format "/folder_name"; only the specified folders and their items will be published.
         items_to_include: List of items in the format "item_name.item_type" that should be published.
         shortcut_exclude_regex: Regex pattern to exclude specific shortcuts from being published in lakehouses.
 
@@ -55,8 +59,15 @@ def publish_all_items(
 
     folder_path_exclude_regex:
         This is an experimental feature in fabric-cicd. Use at your own risk as selective deployments are
-        not recommended due to item dependencies. To enable this feature, see How To -> Optional Features
-        for information on which flags to enable.
+        not recommended due to item dependencies. Cannot be used together with ``folder_path_to_include``
+        for the same environment. To enable this feature, see How To -> Optional Features for information
+        on which flags to enable.
+
+    folder_path_to_include:
+        This is an experimental feature in fabric-cicd. Use at your own risk as selective deployments are
+        not recommended due to item dependencies. Cannot be used together with ``folder_path_exclude_regex``
+        for the same environment. To enable this feature, see How To -> Optional Features for information
+        on which flags to enable.
 
     items_to_include:
         This is an experimental feature in fabric-cicd. Use at your own risk as selective deployments are
@@ -97,8 +108,20 @@ def publish_all_items(
         ...     repository_directory="/path/to/repo",
         ...     item_type_in_scope=["Environment", "Notebook", "DataPipeline"]
         ... )
-        >>> folder_exclude_regex = "^legacy/"
+        >>> folder_exclude_regex = "^/legacy"
         >>> publish_all_items(workspace, folder_path_exclude_regex=folder_exclude_regex)
+
+        With folder inclusion
+        >>> from fabric_cicd import FabricWorkspace, publish_all_items, append_feature_flag
+        >>> append_feature_flag("enable_experimental_features")
+        >>> append_feature_flag("enable_include_folder")
+        >>> workspace = FabricWorkspace(
+        ...     workspace_id="your-workspace-id",
+        ...     repository_directory="/path/to/repo",
+        ...     item_type_in_scope=["Environment", "Notebook", "DataPipeline"]
+        ... )
+        >>> folder_path_to_include = ["/subfolder"]
+        >>> publish_all_items(workspace, folder_path_to_include=folder_path_to_include)
 
         With items to include
         >>> from fabric_cicd import FabricWorkspace, publish_all_items, append_feature_flag
@@ -161,6 +184,18 @@ def publish_all_items(
         raise FailedPublishedItemStatusError(msg, logger)
 
     if FeatureFlag.DISABLE_WORKSPACE_FOLDER_PUBLISH.value not in constants.FEATURE_FLAG:
+        if folder_path_exclude_regex is not None and folder_path_to_include is not None:
+            msg = "Cannot use both 'folder_path_exclude_regex' and 'folder_path_to_include' simultaneously. Choose one filtering strategy."
+            raise InputError(msg, logger)
+
+        if folder_path_exclude_regex is not None:
+            validate_folder_path_exclude_regex(folder_path_exclude_regex)
+            fabric_workspace_obj.publish_folder_path_exclude_regex = folder_path_exclude_regex
+
+        if folder_path_to_include is not None:
+            validate_folder_path_to_include(folder_path_to_include)
+            fabric_workspace_obj.publish_folder_path_to_include = folder_path_to_include
+
         fabric_workspace_obj._refresh_deployed_folders()
         fabric_workspace_obj._refresh_repository_folders()
         fabric_workspace_obj._publish_folders()
@@ -173,10 +208,6 @@ def publish_all_items(
             "Using item_name_exclude_regex is risky as it can prevent needed dependencies from being deployed.  Use at your own risk."
         )
         fabric_workspace_obj.publish_item_name_exclude_regex = item_name_exclude_regex
-
-    if folder_path_exclude_regex:
-        validate_folder_path_exclude_regex(folder_path_exclude_regex)
-        fabric_workspace_obj.publish_folder_path_exclude_regex = folder_path_exclude_regex
 
     if items_to_include:
         validate_items_to_include(items_to_include, operation=constants.OperationType.PUBLISH)
@@ -298,7 +329,7 @@ def deploy_with_config(
     environment: str = "N/A",
     token_credential: Optional[TokenCredential] = None,
     config_override: Optional[dict] = None,
-) -> None:
+) -> DeploymentResult:
     """
     Deploy items using YAML configuration file with environment-specific settings.
     This function provides a simplified deployment interface that loads configuration
@@ -312,23 +343,40 @@ def deploy_with_config(
         token_credential: Optional Azure token credential for authentication.
         config_override: Optional dictionary to override specific configuration values.
 
+    Returns:
+        DeploymentResult: A result object containing the deployment status, message, and
+            responses (opt-in). The status will be DeploymentStatus.COMPLETED on success.
+            The responses field contains API response data when the
+            ``enable_response_collection`` feature flag is enabled and responses were collected,
+            otherwise None.
+
     Raises:
-        InputError: If configuration file is invalid or environment not found.
-        FileNotFoundError: If configuration file doesn't exist.
+        InputError: If configuration is invalid, environment not found, or input validation fails.
+        ConfigValidationError: If configuration file is missing or fails structural validation.
+
+    Note:
+        On failure, the raised exception will have a ``deployment_result`` attribute
+        containing a ``DeploymentResult`` with ``status`` set to
+        ``DeploymentStatus.FAILED``, ``message`` set to the error description, and
+        ``responses`` containing any partial API responses collected before the failure
+        (requires the ``enable_response_collection`` feature flag, otherwise None).
 
     Examples:
         Basic usage
         >>> from fabric_cicd import deploy_with_config
-        >>> deploy_with_config(
+        >>> result = deploy_with_config(
         ...     config_file_path="workspace/config.yml",
         ...     environment="prod"
         ... )
+        >>> print(result.status)    # DeploymentStatus.COMPLETED
+        >>> print(result.message)   # "Deployment completed successfully"
+        >>> print(result.responses) # API responses if collected and feature flag enabled
 
         With custom authentication
         >>> from fabric_cicd import deploy_with_config
         >>> from azure.identity import ClientSecretCredential
         >>> credential = ClientSecretCredential(tenant_id, client_id, client_secret)
-        >>> deploy_with_config(
+        >>> result = deploy_with_config(
         ...     config_file_path="workspace/config.yml",
         ...     environment="prod",
         ...     token_credential=credential
@@ -338,7 +386,7 @@ def deploy_with_config(
         >>> from fabric_cicd import deploy_with_config
         >>> from azure.identity import ClientSecretCredential
         >>> credential = ClientSecretCredential(tenant_id, client_id, client_secret)
-        >>> deploy_with_config(
+        >>> result = deploy_with_config(
         ...     config_file_path="workspace/config.yml",
         ...     environment="prod",
         ...     config_override={
@@ -352,53 +400,96 @@ def deploy_with_config(
         ...         }
         ...     }
         ... )
+
+        Handling deployment failures
+        >>> from fabric_cicd import deploy_with_config
+        >>> try:
+        ...     result = deploy_with_config(
+        ...         config_file_path="workspace/config.yml",
+        ...         environment="prod"
+        ...     )
+        ...     print(result.status)    # DeploymentStatus.COMPLETED
+        ...     print(result.message)   # "Deployment completed successfully"
+        ...     print(result.responses) # API responses if collected (feature flag enabled via config file)
+        ... except Exception as e:
+        ...     print(e.deployment_result.status)    # DeploymentStatus.FAILED
+        ...     print(e.deployment_result.message)   # Original error message
+        ...     print(e.deployment_result.responses) # Partial API responses or None
     """
     log_header(logger, "Config-Based Deployment")
     logger.info(f"Loading configuration from {config_file_path} for environment '{environment}'")
 
-    # Validate environment
-    environment = validate_environment(environment)
+    # Initialize workspace as None so it exists in except block scope
+    workspace = None
+    responses_enabled = False
 
-    # Load and validate configuration file
-    config = load_config_file(config_file_path, environment, config_override)
+    try:
+        # Validate environment
+        environment = validate_environment(environment)
 
-    # Extract environment-specific settings
-    workspace_settings = extract_workspace_settings(config, environment)
-    publish_settings = extract_publish_settings(config, environment)
-    unpublish_settings = extract_unpublish_settings(config, environment)
+        # Load and validate configuration file
+        config = load_config_file(config_file_path, environment, config_override)
 
-    # Apply feature flags and constants if specified
-    apply_config_overrides(config, environment)
+        # Extract environment-specific settings
+        workspace_settings = extract_workspace_settings(config, environment)
+        publish_settings = extract_publish_settings(config, environment)
+        unpublish_settings = extract_unpublish_settings(config, environment)
 
-    # Create FabricWorkspace object with extracted settings
-    workspace = FabricWorkspace(
-        repository_directory=workspace_settings["repository_directory"],
-        item_type_in_scope=workspace_settings.get("item_types_in_scope"),
-        environment=environment,
-        workspace_id=workspace_settings.get("workspace_id"),
-        workspace_name=workspace_settings.get("workspace_name"),
-        token_credential=token_credential,
-        parameter_file_path=workspace_settings.get("parameter_file_path"),
-    )
-    # Execute deployment operations based on skip settings
-    if not publish_settings.get("skip", False):
-        publish_all_items(
-            workspace,
-            item_name_exclude_regex=publish_settings.get("exclude_regex"),
-            folder_path_exclude_regex=publish_settings.get("folder_exclude_regex"),
-            items_to_include=publish_settings.get("items_to_include"),
-            shortcut_exclude_regex=publish_settings.get("shortcut_exclude_regex"),
+        # Apply feature flags and constants if specified
+        with config_overrides_scope(config, environment):
+            # Determine if response collection flag has been enabled in the config file
+            responses_enabled = FeatureFlag.ENABLE_RESPONSE_COLLECTION.value in constants.FEATURE_FLAG
+
+            # Create FabricWorkspace object with extracted settings
+            workspace = FabricWorkspace(
+                repository_directory=workspace_settings["repository_directory"],
+                item_type_in_scope=workspace_settings.get("item_types_in_scope"),
+                environment=environment,
+                workspace_id=workspace_settings.get("workspace_id"),
+                workspace_name=workspace_settings.get("workspace_name"),
+                token_credential=token_credential,
+                parameter_file_path=workspace_settings.get("parameter_file_path"),
+            )
+            # Execute deployment operations based on skip settings
+            if not publish_settings.get("skip", False):
+                publish_all_items(
+                    workspace,
+                    item_name_exclude_regex=publish_settings.get("exclude_regex"),
+                    folder_path_exclude_regex=publish_settings.get("folder_exclude_regex"),
+                    folder_path_to_include=publish_settings.get("folder_path_to_include"),
+                    items_to_include=publish_settings.get("items_to_include"),
+                    shortcut_exclude_regex=publish_settings.get("shortcut_exclude_regex"),
+                )
+            else:
+                logger.info(f"Skipping publish operation for environment '{environment}'")
+
+            if not unpublish_settings.get("skip", False):
+                unpublish_all_orphan_items(
+                    workspace,
+                    item_name_exclude_regex=unpublish_settings.get("exclude_regex", "^$"),
+                    items_to_include=unpublish_settings.get("items_to_include"),
+                )
+            else:
+                logger.info(f"Skipping unpublish operation for environment '{environment}'")
+
+    except Exception as e:
+        e.deployment_result = DeploymentResult(
+            status=DeploymentStatus.FAILED,
+            message=str(e),
+            responses=_collect_responses(workspace, responses_enabled),
         )
-    else:
-        logger.info(f"Skipping publish operation for environment '{environment}'")
-
-    if not unpublish_settings.get("skip", False):
-        unpublish_all_orphan_items(
-            workspace,
-            item_name_exclude_regex=unpublish_settings.get("exclude_regex", "^$"),
-            items_to_include=unpublish_settings.get("items_to_include"),
-        )
-    else:
-        logger.info(f"Skipping unpublish operation for environment '{environment}'")
+        raise
 
     logger.info("Config-based deployment completed successfully")
+    return DeploymentResult(
+        status=DeploymentStatus.COMPLETED,
+        message="Deployment completed successfully",
+        responses=_collect_responses(workspace, responses_enabled),
+    )
+
+
+def _collect_responses(workspace: Optional[FabricWorkspace], responses_enabled: bool) -> Optional[dict]:
+    """Return collected API responses if available, otherwise None."""
+    if responses_enabled and workspace is not None and workspace.responses:
+        return workspace.responses
+    return None
